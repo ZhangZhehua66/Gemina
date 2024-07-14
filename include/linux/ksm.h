@@ -19,10 +19,14 @@ struct stable_node;
 struct mem_cgroup;
 
 #ifdef CONFIG_KSM
+extern unsigned int ksm_ctl_free;
+
 int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
 		unsigned long end, int advice, unsigned long *vm_flags);
 int __ksm_enter(struct mm_struct *mm);
 void __ksm_exit(struct mm_struct *mm);
+int unmerge_ksm_pages(struct vm_area_struct *vma,
+			     unsigned long start, unsigned long end);
 
 static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 {

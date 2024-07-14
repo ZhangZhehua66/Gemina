@@ -73,6 +73,7 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
+#include <linux/libra.h>
 
 #include <trace/events/kmem.h>
 
@@ -159,6 +160,118 @@ core_initcall(init_zero_pfn);
 void mm_trace_rss_stat(struct mm_struct *mm, int member, long count)
 {
 	trace_rss_stat(mm, member, count);
+}
+
+struct kmem_cache *libra_popltable_node_cachep;
+// unsigned int util_threshold = 30;
+
+// struct kmem_cache *libra_aggregate_node_cachep;
+struct list_head popl_list;
+spinlock_t popl_list_lock;
+void __init libra_kmem_cache_init(void)
+{
+	libra_popltable_node_cachep = kmem_cache_create("libra_popltable_node", 
+            sizeof(popl_node_t), 0,
+			SLAB_PANIC, NULL);
+	INIT_LIST_HEAD(&popl_list);
+	spin_lock_init(&popl_list_lock);
+	// libra_aggregate_node_cachep = kmem_cache_create("libra_aggregate_node", 
+    //         sizeof(aggr_node_t), 0,
+	// 		SLAB_PANIC, NULL);
+}
+
+void init_population_node(popl_node_t *node) {
+    int i;
+    for (i = 0; i < PO_HASH_SIZE; ++i) {
+        node->hash_array[i] = 0;
+    }
+}
+
+popl_node_t *libra_popltable_node_alloc(void)
+{
+    popl_node_t *node;
+	node  = kmem_cache_zalloc(libra_popltable_node_cachep, GFP_ATOMIC);
+	if (!node)
+		return NULL;
+	memset(node, 0, sizeof(popl_node_t));
+	init_population_node(node);
+	return node;
+}
+
+void libra_popltable_node_free(popl_node_t *node)
+{
+	kmem_cache_free(libra_popltable_node_cachep, node);
+}
+
+/*crud*/
+popl_node_t *libra_popl_node_lookup_nolock(struct mm_struct *mm, unsigned long address)
+{
+    popl_node_t *popl_node = NULL;
+    hash_for_each_possible_rcu(mm->popl_table, popl_node, phash_node ,PAGE_ALIGN_FLOOR(address) ) {
+        if (popl_node->addr == PAGE_ALIGN_FLOOR(address)){
+			return popl_node;
+		}
+    }
+	return NULL;
+}
+
+popl_node_t *libra_popl_node_lookup(struct mm_struct *mm, unsigned long address)
+{
+	spin_lock(&mm->libra_poplmap_lock);	
+    popl_node_t *popl_node = NULL;
+    hash_for_each_possible_rcu(mm->popl_table, popl_node, phash_node ,PAGE_ALIGN_FLOOR(address) ) {
+        if (popl_node->addr == PAGE_ALIGN_FLOOR(address)){
+			spin_unlock(&mm->libra_poplmap_lock);
+			return popl_node;
+		}
+    }
+	spin_unlock(&mm->libra_poplmap_lock);
+	return NULL;
+}
+
+void libra_popl_node_delete(struct mm_struct *mm, unsigned long address)
+{
+	popl_node_t *popl_node= libra_popl_node_lookup(mm, address);
+	if (popl_node) 
+		hash_del_rcu(&(popl_node->phash_node));
+}
+
+void libra_popl_node_insert(struct mm_struct *mm,
+		unsigned long address, popl_node_t *node)
+{
+	spin_lock(&mm->libra_poplmap_lock);
+	node->addr = PAGE_ALIGN_FLOOR(address);
+	node->mm = mm;
+	hash_add_rcu(mm->popl_table, &(node->phash_node), node->addr);
+	spin_unlock(&mm->libra_poplmap_lock);
+}
+
+void libra_clear_popltable_range(struct mm_struct *mm, 
+		unsigned long start, unsigned long end) 
+{
+	unsigned long i;
+	unsigned int pos = 0;
+	unsigned long haddr;
+
+	popl_node_t *popl_node = NULL;
+	spin_lock(&mm->libra_poplmap_lock);
+	for (i = start; i < end; i += PAGE_SIZE) {
+		haddr = i & HPAGE_PMD_MASK;
+		pos = i & (HPAGE_PMD_SIZE - 1);
+		pos = pos >> PAGE_SHIFT;
+
+		/*popl_node = libra_popl_node_lookup_nolock(mm, 
+				HPAGE_ALIGN_FLOOR(i));
+
+		if (popl_node) {
+			bitmap_clear(popl_node->popl_bitmap, pos, 1);
+			popl_node->committed = 0;
+		}
+		*/
+	}
+	spin_unlock(&mm->libra_poplmap_lock);
+	printk("libra_clear_popltable_range_success: start=%lu, end=%lu",
+		start, end);
 }
 
 #if defined(SPLIT_RSS_COUNTING)
@@ -2583,9 +2696,19 @@ static inline bool cow_user_page(struct page *dst, struct page *src,
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long addr = vmf->address;
-
+	popl_node_t *popl_node=NULL;
+	
 	if (likely(src)) {
 		copy_user_highpage(dst, src, addr, vma);
+		// popl_node = libra_popl_node_lookup(vma->vm_mm, 
+		// 	HPAGE_ALIGN_FLOOR(vmf->address));
+		// if (!popl_node){
+		// 	popl_node = libra_popltable_node_alloc();
+		// 	libra_popl_node_insert(vma->vm_mm, 
+		// 		HPAGE_ALIGN_FLOOR(vmf->address), popl_node);
+		// }
+		// popl_node->cows++;
+		vma->cows++;
 		return true;
 	}
 
@@ -2823,6 +2946,7 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	pte_t entry;
 	int page_copied = 0;
 	struct mmu_notifier_range range;
+	popl_node_t *popl_node=NULL;
 
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
@@ -2832,6 +2956,15 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 							      vmf->address);
 		if (!new_page)
 			goto oom;
+		// popl_node = libra_popl_node_lookup(vma->vm_mm, 
+		// 	HPAGE_ALIGN_FLOOR(vmf->address));
+		// if (!popl_node){
+		// 	popl_node = libra_popltable_node_alloc();
+		// 	libra_popl_node_insert(vma->vm_mm, 
+		// 		HPAGE_ALIGN_FLOOR(vmf->address), popl_node);
+		// }
+		// popl_node->cows++;
+		vma->cows++;
 	} else {
 		new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
 				vmf->address);

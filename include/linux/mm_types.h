@@ -3,6 +3,7 @@
 #define _LINUX_MM_TYPES_H
 
 #include <linux/mm_types_task.h>
+#include <linux/hashtable.h>
 
 #include <linux/auxvec.h>
 #include <linux/list.h>
@@ -371,6 +372,8 @@ struct vm_area_struct {
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
 #endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
+	unsigned int cows;
+	unsigned int ksms;
 } __randomize_layout;
 
 struct core_thread {
@@ -558,6 +561,9 @@ struct mm_struct {
 #endif
 	} __randomize_layout;
 
+	/*by ZhangLangEBa*/
+	spinlock_t libra_poplmap_lock;
+    struct hlist_head popl_table[10240];
 	/*
 	 * The mm_cpumask needs to be at the end of mm_struct, because it
 	 * is dynamically sized based on nr_cpu_ids.

@@ -15,6 +15,9 @@
  *          (lots of bits borrowed from Ingo Molnar & Andrew Morton)
  */
 
+// #include "asm/page_types.h"
+// #include "linux/page_ref.h"
+// #include "linux/string.h"
 #include <linux/stddef.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
@@ -70,6 +73,8 @@
 #include <linux/psi.h>
 #include <linux/padata.h>
 #include <linux/khugepaged.h>
+#include <linux/xxhash.h>
+#include <linux/ksm.h>
 
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
@@ -117,6 +122,22 @@ EXPORT_PER_CPU_SYMBOL(numa_node);
 
 DEFINE_STATIC_KEY_TRUE(vm_numa_stat_key);
 
+// #define barrier_data(ptr) \
+// __asm__ __volatile__("": :"r"(ptr) :"memory")
+
+// void memzero_explicit(void *s, size_t count) {
+// memset(s, 0, count);
+// barrier_data(s);
+// }
+
+static inline void zero_fill_page_ntstores(struct page *page)
+{
+	void *kaddr;
+	kaddr = kmap_atomic(page);
+	memzero_explicit(kaddr, PAGE_SIZE);
+	kunmap_atomic(kaddr);
+}
+
 #ifdef CONFIG_HAVE_MEMORYLESS_NODES
 /*
  * N.B., Do NOT reference the '_numa_mem_' per cpu variable directly.
@@ -157,6 +178,8 @@ nodemask_t node_states[NR_NODE_STATES] __read_mostly = {
 #endif	/* NUMA */
 };
 EXPORT_SYMBOL(node_states);
+
+static int aa_zero_hash=0;
 
 atomic_long_t _totalram_pages __read_mostly;
 EXPORT_SYMBOL(_totalram_pages);
@@ -1421,6 +1444,15 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	spin_unlock(&zone->lock);
 }
 
+static u32 calc_checksum1(struct page *page)
+{
+	u32 checksum;
+	void *addr = kmap_atomic(page);
+	checksum = xxhash(addr, PAGE_SIZE, 0);
+	kunmap_atomic(addr);
+	return checksum;
+}
+
 static void free_one_page(struct zone *zone,
 				struct page *page, unsigned long pfn,
 				unsigned int order,
@@ -1431,7 +1463,16 @@ static void free_one_page(struct zone *zone,
 		is_migrate_isolate(migratetype))) {
 		migratetype = get_pfnblock_migratetype(page, pfn);
 	}
+	//here add zeroing page
+	// trace_printk("before_free:%u, count=%d, mapc=%d, iszero%d\n",
+	// 	calc_checksum1(page), page_count(page), 
+	// 	page_mapcount(page), calc_checksum1(page)==ksm_zero_hash);
 	__free_one_page(page, pfn, zone, order, migratetype, fpi_flags);
+	if (page_count(page)==0&&page_mapcount(page)==-128) 
+			zero_fill_page_ntstores(page);	
+	// trace_printk("after_free:%u, count=%d, mapc=%d, iszero%d\n",
+	// 	calc_checksum1(page), page_count(page), 
+	// 	page_mapcount(page), calc_checksum1(page)==ksm_zero_hash);
 	spin_unlock(&zone->lock);
 }
 

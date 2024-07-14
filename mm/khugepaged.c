@@ -1,4 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
+// #include "asm-generic/memory_model.h"
+// #include "asm/page.h"
+// #include "asm/page_types.h"
+// #include "linux/mm_types.h"
+// #include "linux/kernel.h"
+#include "linux/compiler.h"
+#include "linux/fs.h"
+#include "linux/kernel.h"
+#include "linux/mm_types.h"
+#include "linux/mmap_lock.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/mm.h>
@@ -18,6 +28,9 @@
 #include <linux/page_idle.h>
 #include <linux/swapops.h>
 #include <linux/shmem_fs.h>
+#include <linux/libra.h>
+#include <linux/ksm.h>
+#include <linux/memory.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -60,6 +73,9 @@ static struct task_struct *khugepaged_thread __read_mostly;
 static DEFINE_MUTEX(khugepaged_mutex);
 
 /* default scan 8*512 pte (or vmas) every 30 second */
+unsigned int unmerges=0;
+// unsigned int nhpages=1;
+// unsigned int npages=1;
 static unsigned int khugepaged_pages_to_scan __read_mostly;
 static unsigned int khugepaged_pages_collapsed;
 static unsigned int khugepaged_full_scans;
@@ -1209,6 +1225,40 @@ out:
 	goto out_up_write;
 }
 
+int get_hot(struct page *head)
+{
+    long i = 0, j = 0, start = 0;
+    unsigned long vm_flags;
+    // struct page_cgroup *pc;
+    struct page *page = NULL;
+    int hot = 0, ksm = 0;
+    struct mem_cgroup *memcg;
+
+	start = page_to_pfn(head);
+    for (i = 0; i < 32; i++)
+    {
+        for (j = 0; j < 16; j++)
+        {
+            page = pfn_to_page(start + i + 32 * j);
+
+            // pc = lookup_page_cgroup(page);
+            // page_referenced(page, 0, sc->target_mem_cgroup, &vm_flags);
+            // if (page_referenced(page, 0, pc, &vm_flags))
+            memcg= page->mem_cgroup;
+            if (page_referenced(page, 0, memcg, &vm_flags))
+                hot++;
+            if (PageKsm(page))
+                ksm++;
+        }
+
+        // if ((hot - ksm) < 3 * (i + 1))
+        //     // break;
+    }
+
+    // printk("<0>""hot:%d ksm:%d\n",hot,ksm);
+    return hot - ksm;
+}
+
 static int khugepaged_scan_pmd(struct mm_struct *mm,
 			       struct vm_area_struct *vma,
 			       unsigned long address,
@@ -1223,6 +1273,9 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 	spinlock_t *ptl;
 	int node = NUMA_NO_NODE, unmapped = 0;
 	bool writable = false;
+	// unsigned long h_addr;
+	// popl_node_t *popl_node;
+	int fori=0, gethot=0;
 
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
@@ -1233,9 +1286,19 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 	}
 
 	memset(khugepaged_node_load, 0, sizeof(khugepaged_node_load));
+	// h_addr = HPAGE_ALIGN_FLOOR(address);
+	// popl_node = libra_popl_node_lookup(mm, h_addr);
+	// if (!popl_node){
+	// 	popl_node = libra_popltable_node_alloc();
+	// 	libra_popl_node_insert(mm, 
+	// 		h_addr, popl_node);
+	// }
+	// if(popl_node&&popl_node->flags!=P_NEED_COLLAPSE)
+	// 	goto out;
 	pte = pte_offset_map_lock(mm, pmd, address, &ptl);
 	for (_address = address, _pte = pte; _pte < pte+HPAGE_PMD_NR;
 	     _pte++, _address += PAGE_SIZE) {
+		fori++;
 		pte_t pteval = *_pte;
 		if (is_swap_pte(pteval)) {
 			if (++unmapped <= khugepaged_max_ptes_swap) {
@@ -1257,6 +1320,7 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
 			if (!userfaultfd_armed(vma) &&
 			    ++none_or_zero <= khugepaged_max_ptes_none) {
+				// popl_node->init_zeros = none_or_zero;
 				continue;
 			} else {
 				result = SCAN_EXCEED_NONE_PTE;
@@ -1294,9 +1358,16 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 			result = SCAN_EXCEED_SHARED_PTE;
 			goto out_unmap;
 		}
-
+		// 	unmerge_ksm_pages(vma, address, address+511*PAGE_SIZE);
+		
 		page = compound_head(page);
-
+		
+		if (fori==510
+		&& shared>0 && shared < 16 &&vma->cows>64) {
+			// &&get_hot(page)<16
+			unmerges++;
+		// unmerge_ksm_pages(vma, address, address+PAGE_SIZE*511);
+		}
 		/*
 		 * Record which node the original page is from and save this
 		 * information to khugepaged_node_load[].
@@ -1357,6 +1428,9 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 		ret = 1;
 	}
 out_unmap:
+	// if (popl_node)
+	// 	popl_node->all_share = shared;
+
 	pte_unmap_unlock(pte, ptl);
 	if (ret) {
 		node = khugepaged_find_target_node();
@@ -2101,6 +2175,11 @@ skip:
 		if (shmem_file(vma->vm_file) && !shmem_huge_enabled(vma))
 			goto skip;
 
+		if (vma->cows *3 > vma->ksms && vma->ksms > 0 && vma->ksms < 2000) {
+			trace_printk("unmerge_ksm: cows=%d, ksms=%d\n", vma->cows, vma->ksms);
+			unmerge_ksm_pages(vma, vma->vm_start, vma->vm_end);
+			vma->cows=0;
+		}
 		while (khugepaged_scan.address < hend) {
 			int ret;
 			cond_resched();
@@ -2133,6 +2212,8 @@ skip:
 			if (progress >= pages)
 				goto breakouterloop;
 		}
+		// trace_printk("vma->cows=%d, vma->ksms=%d\n", vma->cows, vma->ksms);
+		vma->cows=0;
 	}
 breakouterloop:
 	mmap_read_unlock(mm); /* exit_mmap will destroy ptes after this */
@@ -2158,6 +2239,8 @@ breakouterloop_mmap_lock:
 		} else {
 			khugepaged_scan.mm_slot = NULL;
 			khugepaged_full_scans++;
+			// trace_printk("unmerges=%d\n",unmerges);
+			// unmerges=0;
 		}
 
 		collect_mm_slot(mm_slot);
@@ -2184,6 +2267,10 @@ static void khugepaged_do_scan(void)
 	unsigned int progress = 0, pass_through_head = 0;
 	unsigned int pages = khugepaged_pages_to_scan;
 	bool wait = true;
+	popl_node_t *popl_node=NULL, *tmp=NULL;
+	struct vm_area_struct *vma;
+	unsigned long hstart, hend, temp_addr;
+	int ret;
 
 	barrier(); /* write khugepaged_pages_to_scan to local stack */
 
@@ -2198,6 +2285,63 @@ static void khugepaged_do_scan(void)
 		if (unlikely(kthread_should_stop() || try_to_freeze()))
 			break;
 
+		spin_lock(&popl_list_lock);
+		if (!list_empty(&popl_list)) {
+			list_for_each_entry_safe(popl_node, tmp, &popl_list, popl_l){
+				if (!popl_node) 
+					continue;
+				list_del(&popl_node->popl_l);
+				popl_node->list_flag=0;
+				temp_addr = popl_node->addr;
+				break;
+			}
+		} else {
+			popl_node = NULL;
+		}
+		spin_unlock(&popl_list_lock);
+
+		if (khugepaged_has_work() &&
+		popl_node&&popl_node->mm) {
+			if (unlikely(!mmap_read_trylock(popl_node->mm)))
+				goto out;
+			vma=find_vma(popl_node->mm, popl_node->addr);
+			while (vma && temp_addr < (vma->vm_end& HPAGE_PMD_MASK)) {
+				cond_resched();
+				
+				if (unlikely(khugepaged_test_exit(popl_node->mm))) {
+					goto out1;
+				}
+				if (!hugepage_vma_check(vma, vma->vm_flags)) {
+skip:
+					goto out1;
+				}
+				hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
+				hend = vma->vm_end & HPAGE_PMD_MASK;
+				if (hstart >= hend)
+					goto skip;
+				if (temp_addr > hend)
+					goto skip;
+				if (temp_addr< hstart)
+					temp_addr = hstart;
+
+				VM_BUG_ON(temp_addr < hstart ||
+				  temp_addr + HPAGE_PMD_SIZE >
+				  hend);
+
+				VM_BUG_ON(temp_addr & ~HPAGE_PMD_MASK);
+					ret = khugepaged_scan_pmd(popl_node->mm, vma,
+					temp_addr,
+					&hpage);
+				
+				/* move to next address */
+				temp_addr += HPAGE_PMD_SIZE;
+				if (!ret)
+					mmap_read_unlock(popl_node->mm);
+			}
+		}
+out1:
+	mmap_read_unlock(popl_node->mm);
+out:
 		spin_lock(&khugepaged_mm_lock);
 		if (!khugepaged_scan.mm_slot)
 			pass_through_head++;

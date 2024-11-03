@@ -5,10 +5,8 @@
 // #include "linux/mm_types.h"
 // #include "linux/kernel.h"
 #include "linux/compiler.h"
-#include "linux/fs.h"
 #include "linux/kernel.h"
 #include "linux/mm_types.h"
-#include "linux/mmap_lock.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/mm.h>
@@ -2175,11 +2173,11 @@ skip:
 		if (shmem_file(vma->vm_file) && !shmem_huge_enabled(vma))
 			goto skip;
 
-		if (vma->cows *3 > vma->ksms && vma->ksms > 0 && vma->ksms < 2000) {
-			trace_printk("unmerge_ksm: cows=%d, ksms=%d\n", vma->cows, vma->ksms);
-			unmerge_ksm_pages(vma, vma->vm_start, vma->vm_end);
-			vma->cows=0;
-		}
+		// if (vma->cows *3 > vma->ksms) {
+		// 	trace_printk("unmerge_ksm: cows=%d, ksms=%d\n", vma->cows, vma->ksms);
+		// 	unmerge_ksm_pages(vma, vma->vm_start, vma->vm_end);
+		// 	vma->cows=0;
+		// }
 		while (khugepaged_scan.address < hend) {
 			int ret;
 			cond_resched();
@@ -2269,8 +2267,7 @@ static void khugepaged_do_scan(void)
 	bool wait = true;
 	popl_node_t *popl_node=NULL, *tmp=NULL;
 	struct vm_area_struct *vma;
-	unsigned long hstart, hend, temp_addr;
-	int ret;
+	unsigned long hstart, hend;
 
 	barrier(); /* write khugepaged_pages_to_scan to local stack */
 
@@ -2285,63 +2282,51 @@ static void khugepaged_do_scan(void)
 		if (unlikely(kthread_should_stop() || try_to_freeze()))
 			break;
 
-		spin_lock(&popl_list_lock);
-		if (!list_empty(&popl_list)) {
-			list_for_each_entry_safe(popl_node, tmp, &popl_list, popl_l){
-				if (!popl_node) 
-					continue;
-				list_del(&popl_node->popl_l);
-				popl_node->list_flag=0;
-				temp_addr = popl_node->addr;
-				break;
+		if (progress==1024) {
+			spin_lock(&popl_list_lock);
+			if (!list_empty(&popl_list)) {
+				list_for_each_entry_safe(popl_node, tmp, &popl_list, popl_l){
+					if (!popl_node) 
+						continue;
+					list_del(&popl_node->popl_l);
+					popl_node->list_flag=0;
+					break;
+				}
+			} else {
+				popl_node = NULL;
 			}
-		} else {
-			popl_node = NULL;
-		}
-		spin_unlock(&popl_list_lock);
+			spin_unlock(&popl_list_lock);
 
-		if (khugepaged_has_work() &&
-		popl_node&&popl_node->mm) {
-			if (unlikely(!mmap_read_trylock(popl_node->mm)))
-				goto out;
-			vma=find_vma(popl_node->mm, popl_node->addr);
-			while (vma && temp_addr < (vma->vm_end& HPAGE_PMD_MASK)) {
-				cond_resched();
-				
-				if (unlikely(khugepaged_test_exit(popl_node->mm))) {
-					goto out1;
+			if (khugepaged_has_work() &&
+			popl_node&&popl_node->mm) {
+				vma=find_vma(popl_node->mm, popl_node->addr);
+				if (vma) {
+					if (unlikely(khugepaged_test_exit(popl_node->mm))) {
+						progress++;
+						continue;
+					}
+					if (!hugepage_vma_check(vma, vma->vm_flags)) {
+	skip:
+						progress++;
+						continue;
+					}
+					hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
+					hend = vma->vm_end & HPAGE_PMD_MASK;
+					if (hstart >= hend)
+						goto skip;
+					if (popl_node->addr > hend)
+						goto skip;
+					if (popl_node->addr < hstart)
+						popl_node->addr = hstart;
+					VM_BUG_ON(popl_node->addr & ~HPAGE_PMD_MASK);
+						progress += khugepaged_scan_pmd(popl_node->mm, vma,
+						popl_node->addr,
+						&hpage);
 				}
-				if (!hugepage_vma_check(vma, vma->vm_flags)) {
-skip:
-					goto out1;
-				}
-				hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
-				hend = vma->vm_end & HPAGE_PMD_MASK;
-				if (hstart >= hend)
-					goto skip;
-				if (temp_addr > hend)
-					goto skip;
-				if (temp_addr< hstart)
-					temp_addr = hstart;
-
-				VM_BUG_ON(temp_addr < hstart ||
-				  temp_addr + HPAGE_PMD_SIZE >
-				  hend);
-
-				VM_BUG_ON(temp_addr & ~HPAGE_PMD_MASK);
-					ret = khugepaged_scan_pmd(popl_node->mm, vma,
-					temp_addr,
-					&hpage);
-				
-				/* move to next address */
-				temp_addr += HPAGE_PMD_SIZE;
-				if (!ret)
-					mmap_read_unlock(popl_node->mm);
 			}
 		}
-out1:
-	mmap_read_unlock(popl_node->mm);
-out:
+
+
 		spin_lock(&khugepaged_mm_lock);
 		if (!khugepaged_scan.mm_slot)
 			pass_through_head++;

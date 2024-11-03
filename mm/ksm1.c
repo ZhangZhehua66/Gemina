@@ -13,17 +13,6 @@
  *	Hugh Dickins
  */
 
-// #include "asm/pgtable.h"
-// #include "linux/kernel.h"
-// #include "linux/mm_types.h"
-// #include "linux/page-flags.h"
-// #include "linux/page_ref.h"
-// #include "linux/printk.h"
-// #include "linux/types.h"
-#include "asm/page_types.h"
-#include "linux/kernel.h"
-#include "linux/overflow.h"
-#include "linux/page-flags.h"
 #include <linux/errno.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
@@ -31,7 +20,6 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
-#include <linux/sched/cputime.h>
 #include <linux/rwsem.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -50,12 +38,6 @@
 #include <linux/freezer.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
-#include <linux/libra.h>
-#include <linux/timer.h>
-#include <linux/mutex.h>
-
-#include <asm/tlbflush.h>
-#include "internal.h"
 
 #include <linux/migrate.h>
 #include <linux/memcontrol.h>
@@ -66,6 +48,9 @@
 #include <asm/pgalloc.h>
 #include <asm/paravirt.h>
 
+#include <asm/tlbflush.h>
+#include "internal.h"
+
 #ifdef CONFIG_NUMA
 #define NUMA(x)		(x)
 #define DO_NUMA(x)	do { (x); } while (0)
@@ -73,6 +58,37 @@
 #define NUMA(x)		(0)
 #define DO_NUMA(x)	do { } while (0)
 #endif
+
+#define BITSPERWORD 32
+#define SHIFT 5
+#define MASK 0x1F
+#define N 1024 * 1024 * 64
+
+int bitmap1[1 + N / BITSPERWORD] = {0}; //申请内存的大小
+int bitmap2[1 + N / BITSPERWORD] = {0}; //申请内存的大小
+// set 设置所在的bit位为1
+// clr 初始化所有的bit位为0
+// test 测试所在的bit为是否为1
+
+static void set_bitmap(int i, int a[]) { a[i >> SHIFT] |= (1 << (i & MASK)); }
+// static void clr_bitmap(int i,int a[]) {        a[i>>SHIFT] &= ~(1<<(i & MASK)); }
+static int test_bitmap(int i, int a[]) { return a[i >> SHIFT] & (1 << (i & MASK)); }
+
+static void reset_bitmap(void)
+{
+    memset(bitmap1, 0, (1 + N / BITSPERWORD) * sizeof(int));
+    memset(bitmap2, 0, (1 + N / BITSPERWORD) * sizeof(int));
+}
+
+int page_rank = 0;
+int merge_count = 30;
+int cold_count = 0;
+static int lru_bound = 3;
+static int merge_sleep_millisecs = 2500;
+static int merge_sleep_millisecs1 = 6000;
+static int small_hot_bound = 128;
+static int do_merge = 0;
+
 
 /**
  * DOC: Overview
@@ -144,7 +160,6 @@ typedef u8 rmap_age_t;
 struct mm_slot {
 	struct hlist_node link;
 	struct list_head mm_list;
-	unsigned int sample_start;
 	struct rmap_item *rmap_list;
 	struct mm_struct *mm;
 };
@@ -197,7 +212,7 @@ struct stable_node {
 		};
 	};
 	struct hlist_head hlist;
-	unsigned int oldchecksum;
+    unsigned int oldchecksum;
 	union {
 		unsigned long kpfn;
 		unsigned long chain_prune_time;
@@ -215,7 +230,6 @@ struct stable_node {
 };
 
 struct head_item;
-
 /**
  * struct rmap_item - reverse mapping item for virtual addresses
  * @rmap_list: next rmap_item in mm_slot's singly-linked rmap_list
@@ -235,7 +249,6 @@ struct rmap_item {
     u8 sleep;
     bool hit;
 	struct vm_area_struct *vma;
-	popl_node_t *popl;
 	rmap_age_t age;
 	rmap_age_t remaining_skips;
 	union {
@@ -246,7 +259,6 @@ struct rmap_item {
 	};
 	struct mm_struct *mm;
 	unsigned long address;		/* + low bits used for flags below */
-	unsigned int checknum;
 	unsigned int oldchecksum;	/* when unstable */
 	union {
 		struct rb_node node;	/* when node of unstable tree */
@@ -256,6 +268,9 @@ struct rmap_item {
 		};
 	};
 };
+
+#define PO_HASH_SIZE 64
+#define O_HASH_SIZE 32
 
 struct head_item
 {
@@ -302,9 +317,6 @@ static struct kmem_cache *head_item_cache;
 static struct kmem_cache *stable_node_cache;
 static struct kmem_cache *mm_slot_cache;
 
-// /* Default number of pages to scan per batch */
-// #define DEFAULT_PAGES_TO_SCAN 100
-
 /* The number of nodes in the stable tree */
 static unsigned long ksm_pages_shared;
 
@@ -331,244 +343,15 @@ static int ksm_max_page_sharing = 256;
 
 /* Number of pages ksmd should scan in one batch */
 static unsigned int ksm_thread_pages_to_scan = 100;
-static unsigned int ksm_thread_sample_pages_to_scan = 10;
-unsigned int sample_size = 256;
-unsigned int sample_inter = 4;
-unsigned int inter_inter = 28;
-u32 ksm_zero_hash = 0;
 
 /* Milliseconds ksmd should sleep between batches */
 static unsigned int ksm_thread_sleep_millisecs = 20;
-static unsigned int ksm_thread_sample_sleep_millisecs = 20;
 
 /* Checksum of an empty (zeroed) page */
 static unsigned int zero_checksum __read_mostly;
 
 /* Whether to merge empty (zeroed) pages with actual zero pages */
 static bool ksm_use_zero_pages __read_mostly;
-
-// /* Don't scan more than max pages per batch. */
-// static unsigned long ksm_advisor_max_pages_to_scan = 30000;
-
-// /* Min CPU for scanning pages per scan */
-// #define KSM_ADVISOR_MIN_CPU 10
-
-// /* Max CPU for scanning pages per scan */
-// static unsigned int ksm_advisor_max_cpu =  70;
-
-// /* Target scan time in seconds to analyze all KSM candidate pages. */
-// static unsigned long ksm_advisor_target_scan_time = 20;
-
-// /* Exponentially weighted moving average. */
-// #define EWMA_WEIGHT 30
-
-// /**
-//  * struct advisor_ctx - metadata for KSM advisor
-//  * @start_scan: start time of the current scan
-//  * @scan_time: scan time of previous scan
-//  * @change: change in percent to pages_to_scan parameter
-//  * @cpu_time: cpu time consumed by the ksmd thread in the previous scan
-//  */
-// struct advisor_ctx {
-// 	ktime_t start_scan;
-// 	unsigned long scan_time;
-// 	unsigned long change;
-// 	unsigned long long cpu_time;
-// };
-// static struct advisor_ctx advisor_ctx;
-
-// /* Define different advisor's */
-// enum ksm_advisor_type {
-// 	KSM_ADVISOR_NONE,
-// 	KSM_ADVISOR_SCAN_TIME,
-// };
-// static enum ksm_advisor_type ksm_advisor;
-
-// #ifdef CONFIG_SYSFS
-// /*
-//  * Only called through the sysfs control interface:
-//  */
-
-// /* At least scan this many pages per batch. */
-// static unsigned long ksm_advisor_min_pages_to_scan = 500;
-
-// static void set_advisor_defaults(void)
-// {
-// 	if (ksm_advisor == KSM_ADVISOR_NONE) {
-// 		ksm_thread_pages_to_scan = DEFAULT_PAGES_TO_SCAN;
-// 	} else if (ksm_advisor == KSM_ADVISOR_SCAN_TIME) {
-// 		advisor_ctx = (const struct advisor_ctx){ 0 };
-// 		ksm_thread_pages_to_scan = ksm_advisor_min_pages_to_scan;
-// 	}
-// }
-// #endif /* CONFIG_SYSFS */
-
-// static inline void advisor_start_scan(void)
-// {
-// 	if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
-// 		advisor_ctx.start_scan = ktime_get();
-// }
-
-// /*
-//  * Use previous scan time if available, otherwise use current scan time as an
-//  * approximation for the previous scan time.
-//  */
-// static inline unsigned long prev_scan_time(struct advisor_ctx *ctx,
-// 					   unsigned long scan_time)
-// {
-// 	return ctx->scan_time ? ctx->scan_time : scan_time;
-// }
-
-// /* Calculate exponential weighted moving average */
-// static unsigned long ewma(unsigned long prev, unsigned long curr)
-// {
-// 	return ((100 - EWMA_WEIGHT) * prev + EWMA_WEIGHT * curr) / 100;
-// }
-
-// /*
-//  * The scan time advisor is based on the current scan rate and the target
-//  * scan rate.
-//  *
-//  *      new_pages_to_scan = pages_to_scan * (scan_time / target_scan_time)
-//  *
-//  * To avoid perturbations it calculates a change factor of previous changes.
-//  * A new change factor is calculated for each iteration and it uses an
-//  * exponentially weighted moving average. The new pages_to_scan value is
-//  * multiplied with that change factor:
-//  *
-//  *      new_pages_to_scan *= change facor
-//  *
-//  * The new_pages_to_scan value is limited by the cpu min and max values. It
-//  * calculates the cpu percent for the last scan and calculates the new
-//  * estimated cpu percent cost for the next scan. That value is capped by the
-//  * cpu min and max setting.
-//  *
-//  * In addition the new pages_to_scan value is capped by the max and min
-//  * limits.
-//  */
-// static void scan_time_advisor(void)
-// {
-// 	unsigned int cpu_percent;
-// 	unsigned long cpu_time;
-// 	unsigned long cpu_time_diff;
-// 	unsigned long cpu_time_diff_ms;
-// 	unsigned long pages;
-// 	unsigned long per_page_cost;
-// 	unsigned long factor;
-// 	unsigned long change;
-// 	unsigned long last_scan_time;
-// 	unsigned long scan_time;
-
-// 	/* Convert scan time to seconds */
-// 	scan_time = div_s64(ktime_ms_delta(ktime_get(), advisor_ctx.start_scan),
-// 			    MSEC_PER_SEC);
-// 	scan_time = scan_time ? scan_time : 1;
-
-// 	/* Calculate CPU consumption of ksmd background thread */
-// 	cpu_time = task_sched_runtime(current);
-// 	cpu_time_diff = cpu_time - advisor_ctx.cpu_time;
-// 	cpu_time_diff_ms = cpu_time_diff / 1000 / 1000;
-
-// 	cpu_percent = (cpu_time_diff_ms * 100) / (scan_time * 1000);
-// 	cpu_percent = cpu_percent ? cpu_percent : 1;
-// 	last_scan_time = prev_scan_time(&advisor_ctx, scan_time);
-
-// 	/* Calculate scan time as percentage of target scan time */
-// 	factor = ksm_advisor_target_scan_time * 100 / scan_time;
-// 	factor = factor ? factor : 1;
-
-// 	/*
-// 	 * Calculate scan time as percentage of last scan time and use
-// 	 * exponentially weighted average to smooth it
-// 	 */
-// 	change = scan_time * 100 / last_scan_time;
-// 	change = change ? change : 1;
-// 	change = ewma(advisor_ctx.change, change);
-
-// 	/* Calculate new scan rate based on target scan rate. */
-// 	pages = ksm_thread_pages_to_scan * 100 / factor;
-// 	/* Update pages_to_scan by weighted change percentage. */
-// 	pages = pages * change / 100;
-
-// 	/* Cap new pages_to_scan value */
-// 	per_page_cost = ksm_thread_pages_to_scan / cpu_percent;
-// 	per_page_cost = per_page_cost ? per_page_cost : 1;
-
-// 	pages = min(pages, per_page_cost * ksm_advisor_max_cpu);
-// 	pages = max(pages, per_page_cost * KSM_ADVISOR_MIN_CPU);
-// 	pages = min(pages, ksm_advisor_max_pages_to_scan);
-
-// 	/* Update advisor context */
-// 	advisor_ctx.change = change;
-// 	advisor_ctx.scan_time = scan_time;
-// 	advisor_ctx.cpu_time = cpu_time;
-
-// 	ksm_thread_pages_to_scan = pages;
-// }
-
-// static void advisor_stop_scan(void)
-// {
-// 	if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
-// 		scan_time_advisor();
-// }
-
-static struct timer_list my_timer;
-static int timer_flag = 0;
-static int timer_init=0;
-
-#define BITSPERWORD 32
-#define SHIFT 5
-#define MASK 0x1F
-#define N 1024 * 1024 * 64 * 2
-
-int bitmap1[1 + N / BITSPERWORD] = {0}; //申请内存的大小
-int bitmap2[1 + N / BITSPERWORD] = {0}; //申请内存的大小
-
-static void set_bitmap(int i, int a[]) { a[i >> SHIFT] |= (1 << (i & MASK)); }
-// static void clr_bitmap(int i,int a[]) {        a[i>>SHIFT] &= ~(1<<(i & MASK)); }
-static int test_bitmap(int i, int a[]) { return a[i >> SHIFT] & (1 << (i & MASK)); }
-
-static void reset_bitmap(void)
-{
-    memset(bitmap1, 0, (1 + N / BITSPERWORD) * sizeof(int));
-    memset(bitmap2, 0, (1 + N / BITSPERWORD) * sizeof(int));
-}
-
-static int check_and_set_bitmap(int i, int flag){
-    if (!flag){
-        if (test_bitmap(i, bitmap1)){
-            set_bitmap(i, bitmap2);
-            return 1;
-        }else{
-            set_bitmap(i, bitmap1);
-            return 0;
-        }
-    }else{
-        if (test_bitmap(i, bitmap2))
-            return 1;
-        else
-            return 0;
-    }
-}
-
-int page_rank = 0;
-int merge_count = 30;
-int cold_count = 0;
-static int lru_bound = 3;
-static int merge_sleep_millisecs = 2500;
-static int merge_sleep_millisecs1 = 6000;
-static int small_hot_bound = 128;
-static int do_merge = 0;
-int change=0;
-
-unsigned int sn_pages=1;
-unsigned int n_pages=1;
-unsigned int hn_pages=1;
-unsigned int P_shares=0;
-unsigned int P_hots=0;
-unsigned int max_npages=0;
-unsigned int peace_th=6;
-unsigned int process_th=8;
 
 #ifdef CONFIG_NUMA
 /* Zeroed when merging across nodes is not allowed */
@@ -601,7 +384,6 @@ static int __init ksm_slab_init(void)
 	rmap_item_cache = KSM_KMEM_CACHE(rmap_item, 0);
 	if (!rmap_item_cache)
 		goto out;
-	
     head_item_cache = KSM_KMEM_CACHE(head_item, 0);
     if (!head_item_cache)
         goto out_free0;
@@ -631,7 +413,7 @@ static void __init ksm_slab_free(void)
 	kmem_cache_destroy(mm_slot_cache);
 	kmem_cache_destroy(stable_node_cache);
 	kmem_cache_destroy(rmap_item_cache);
-	kmem_cache_destroy(head_item_cache);
+    kmem_cache_destroy(head_item_cache);
 	mm_slot_cache = NULL;
 }
 
@@ -648,6 +430,7 @@ static inline void free_head_item(struct head_item *head_item)
 {
     kmem_cache_free(head_item_cache, head_item);
 }
+
 
 static __always_inline bool is_stable_node_chain(struct stable_node *chain)
 {
@@ -947,6 +730,11 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 {
 	struct rmap_item *rmap_item;
 
+    if (!stable_node)
+        return;
+    if (!(&stable_node->hlist))
+        return;
+
 	/* check it's not STABLE_NODE_CHAIN or negative */
 	BUG_ON(stable_node->rmap_hlist_len < 0);
 
@@ -955,12 +743,6 @@ static void remove_node_from_stable_tree(struct stable_node *stable_node)
 			ksm_pages_sharing--;
 		else
 			ksm_pages_shared--;
-		if (rmap_item->vma && rmap_item->vma->ksms>0) {
-			rmap_item->vma->ksms--;
-		}
-		// if(rmap_item->popl
-		// && rmap_item->popl->this_share>0)
-		// 	rmap_item->popl->this_share--;
 		VM_BUG_ON(stable_node->rmap_hlist_len <= 0);
 		stable_node->rmap_hlist_len--;
 		put_anon_vma(rmap_item->anon_vma);
@@ -1110,9 +892,6 @@ static void remove_rmap_item_from_tree(struct rmap_item *rmap_item)
 			ksm_pages_sharing--;
 		else
 			ksm_pages_shared--;
-		// if(rmap_item->popl
-		// 	&& rmap_item->popl->this_share>0)
-		// 	rmap_item->popl->this_share--;
 		VM_BUG_ON(stable_node->rmap_hlist_len <= 0);
 		stable_node->rmap_hlist_len--;
 
@@ -1147,7 +926,7 @@ static void remove_trailing_rmap_items(struct mm_slot *mm_slot,
 		struct rmap_item *rmap_item = *rmap_list;
 		*rmap_list = rmap_item->rmap_list;
 		remove_rmap_item_from_tree(rmap_item);
-		if (rmap_item->head_item)
+        if (rmap_item->head_item)
         {
             free_head_item(rmap_item->head_item);
             rmap_item->head_item = NULL;
@@ -1156,48 +935,6 @@ static void remove_trailing_rmap_items(struct mm_slot *mm_slot,
 	}
 }
 
-/*
- * Removing rmap_item from stable or unstable tree.
- * This function will clean the information from the stable/unstable tree.
- */
-static void remove_rmap_item_from_unstable_tree(struct rmap_item *rmap_item)
-{
-	if (rmap_item->address & UNSTABLE_FLAG) {
-		unsigned char age;
-		/*
-		 * Usually ksmd can and must skip the rb_erase, because
-		 * root_unstable_tree was already reset to RB_ROOT.
-		 * But be careful when an mm is exiting: do the rb_erase
-		 * if this rmap_item was inserted by this scan, rather
-		 * than left over from before.
-		 */
-		age = (unsigned char)(ksm_scan.seqnr - rmap_item->address);
-		// BUG_ON(age > 1);
-		if (!age)
-			rb_erase(&rmap_item->node,
-				 root_unstable_tree + NUMA(rmap_item->nid));
-		ksm_pages_unshared--;
-		rmap_item->address &= PAGE_MASK;
-	}
-out:
-	cond_resched();		/* we're called from many long loops */
-}
-
-static void remove_trailing_unstable_rmap_items(struct mm_slot *mm_slot,
-				       struct rmap_item **rmap_list)
-{
-	while (*rmap_list) {
-		struct rmap_item *rmap_item = *rmap_list;
-		*rmap_list = rmap_item->rmap_list;
-		remove_rmap_item_from_tree(rmap_item);
-		if (rmap_item->head_item)
-        {
-            free_head_item(rmap_item->head_item);
-            rmap_item->head_item = NULL;
-        }
-		free_rmap_item(rmap_item);
-	}
-}
 /*
  * Though it's very tempting to unmerge rmap_items from stable tree rather
  * than check every pte of a given vma, the locking doesn't quite work for
@@ -1211,7 +948,7 @@ static void remove_trailing_unstable_rmap_items(struct mm_slot *mm_slot,
  * to the next pass of ksmd - consider, for example, how ksmd might be
  * in cmp_and_merge_page on one of the rmap_items we would be removing.
  */
-int unmerge_ksm_pages(struct vm_area_struct *vma,
+static int unmerge_ksm_pages(struct vm_area_struct *vma,
 			     unsigned long start, unsigned long end)
 {
 	unsigned long addr;
@@ -1428,6 +1165,7 @@ static int memcmp_checksum(unsigned int checksum1, unsigned int checksum2)
     return ret;
 }
 
+
 static int write_protect_page(struct vm_area_struct *vma, struct page *page,
 			      pte_t *orig_pte)
 {
@@ -1578,13 +1316,7 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
 	page_remove_rmap(page, false);
 	if (!page_mapped(page))
 		try_to_free_swap(page);
-	// trace_printk("before_put:%u, count=%d, mapc=%d, iszero%d\n",
-	// 	calc_checksum(page), page_count(page), 
-	// 	page_mapcount(page), calc_checksum(page)==ksm_zero_hash);
 	put_page(page);
-	// trace_printk("after_put:%u, count=%d, mapc=%d, iszero%d\n",
-	// 	calc_checksum(page), page_count(page), 
-	// 	page_mapcount(page), calc_checksum(page)==ksm_zero_hash);
 
 	pte_unmap_unlock(ptep, ptl);
 	err = 0;
@@ -1626,14 +1358,8 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
 		goto out;
 
 	if (PageTransCompound(page)) {
-		if (split_huge_page(page)){
-			// if (rmap_item->popl) {
-			// 	rmap_item->popl->small_age=1;
-			// 	rmap_item->popl->huge_age=0;
-			// 	rmap_item->popl->flags=P_ALREADY_SPLIT;
-			// }
+		if (split_huge_page(page))
 			goto out_unlock;
-		}
 	}
 
 	/*
@@ -2294,6 +2020,7 @@ again:
 
 	INIT_HLIST_HEAD(&stable_node_dup->hlist);
 	stable_node_dup->kpfn = kpfn;
+    stable_node_dup->oldchecksum = calc_checksum(kpage);
 	set_page_stable_node(kpage, stable_node_dup);
 	stable_node_dup->rmap_hlist_len = 0;
 	DO_NUMA(stable_node_dup->nid = nid);
@@ -2333,7 +2060,7 @@ again:
 static
 struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 					      struct page *page,
-					      struct page **tree_pagep)
+					      struct page **tree_pagep, bool insert)
 {
 	struct rb_node **new;
 	struct rb_root *root;
@@ -2363,10 +2090,8 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 			return NULL;
 		}
 
-		// if (change)
-			ret = memcmp_pages(page, tree_page);
-		// else
-			// ret = memcmp_checksum(rmap_item->oldchecksum, tree_rmap_item->oldchecksum);
+		// ret = memcmp_pages(page, tree_page);
+		ret = memcmp_checksum(rmap_item->oldchecksum, tree_rmap_item->oldchecksum);
 
 		parent = *new;
 		if (ret < 0) {
@@ -2389,6 +2114,8 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 			return tree_rmap_item;
 		}
 	}
+    if (!insert)
+        return NULL;
 
 	rmap_item->address |= UNSTABLE_FLAG;
 	rmap_item->address |= (ksm_scan.seqnr & SEQNR_MASK);
@@ -2435,11 +2162,6 @@ static void stable_tree_append(struct rmap_item *rmap_item,
 		ksm_pages_sharing++;
 	else
 		ksm_pages_shared++;
-	if (rmap_item->vma) {
-		rmap_item->vma->ksms++;
-	}
-	// if(rmap_item->popl)
-	// 	rmap_item->popl->this_share++;
 }
 
 /*
@@ -2451,8 +2173,7 @@ static void stable_tree_append(struct rmap_item *rmap_item,
  * @page: the page that we are searching identical page to.
  * @rmap_item: the reverse mapping into the virtual address of this page
  */
-static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item,
-	bool should_check)
+static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 {
 	struct mm_struct *mm = rmap_item->mm;
 	struct rmap_item *tree_rmap_item;
@@ -2482,6 +2203,19 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item,
 		if (!is_page_sharing_candidate(stable_node))
 			max_page_sharing_bypass = true;
 	}
+
+    checksum = calc_checksum(page);
+    if (rmap_item->oldchecksum != checksum)
+    {
+        if (!rmap_item->oldchecksum)
+            rmap_item->oldchecksum = checksum;
+        else
+        {
+            rmap_item->oldchecksum = checksum;
+            remove_rmap_item_from_tree(rmap_item);
+            return;
+        }
+    }
 
 	/* We first start with searching the page inside the stable tree */
 	kpage = stable_tree_search(page);
@@ -2517,26 +2251,11 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item,
 	 * don't want to insert it in the unstable tree, and we don't want
 	 * to waste our time searching for something identical to it there.
 	 */
-	checksum = calc_checksum(page);
-    if (rmap_item->oldchecksum != checksum){
-
-        if (!rmap_item->oldchecksum)
-            rmap_item->oldchecksum = checksum;
-        else{
-            rmap_item->oldchecksum = checksum;
-			rmap_item->checknum++;
-        }
-
-		if (should_check) {
-			return;
-		}
-
-		if (rmap_item->checknum>2) {
-			rmap_item->checknum/=2;
-			return;
-		}
-    }else 
-		rmap_item->checknum=0;
+	// checksum = calc_checksum(page);
+	// if (rmap_item->oldchecksum != checksum) {
+	// 	rmap_item->oldchecksum = checksum;
+	// 	return;
+	// }
 
 	/*
 	 * Same checksum as an empty page. We attempt to merge it with the
@@ -2566,7 +2285,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item,
 			return;
 	}
 	tree_rmap_item =
-		unstable_tree_search_insert(rmap_item, page, &tree_page);
+		unstable_tree_search_insert(rmap_item, page, &tree_page, true);
 	if (tree_rmap_item) {
 		bool split;
 
@@ -2623,11 +2342,6 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item,
 			if (!trylock_page(page))
 				return;
 			split_huge_page(page);
-			// if (rmap_item->popl) {
-			// 	rmap_item->popl->small_age=1;
-			// 	rmap_item->popl->huge_age=0;
-			// 	// rmap_item->popl->flags=P_ALREADY_SPLIT;
-			// }
 			unlock_page(page);
 		}
 	}
@@ -2647,11 +2361,13 @@ static struct rmap_item *get_next_rmap_item(struct mm_slot *mm_slot,
 			break;
 		*rmap_list = rmap_item->rmap_list;
 		remove_rmap_item_from_tree(rmap_item);
-		if (rmap_item->head_item)
+
+        if (rmap_item->head_item)
         {
             free_head_item(rmap_item->head_item);
             rmap_item->head_item = NULL;
         }
+
 		free_rmap_item(rmap_item);
 	}
 
@@ -2659,114 +2375,51 @@ static struct rmap_item *get_next_rmap_item(struct mm_slot *mm_slot,
 	if (rmap_item) {
 		/* It has already been zeroed */
 		rmap_item->mm = mm_slot->mm;
-		rmap_item->address = addr;
-		// rmap_item->address = addr & PAGE_MASK;
+		// rmap_item->address = addr;
+        rmap_item->address = addr & PAGE_MASK;
 		rmap_item->rmap_list = *rmap_list;
 		*rmap_list = rmap_item;
-		rmap_item->head_item = NULL;
+        rmap_item->head_item = NULL;
         rmap_item->was_huge = 0;
         rmap_item->sleep = 0;
         rmap_item->oldchecksum = 0;
-		rmap_item->checknum=0;
         rmap_item->hit = false;
 	}
 	return rmap_item;
 }
 
-int cal_hot(struct page *head)
+static struct rmap_item *my_get_next_rmap_item(struct mm_slot *mm_slot,
+                                               struct rmap_item **rmap_list,
+                                               unsigned long addr)
 {
-    int i = 0, j = 0, start = page_to_pfn(head);
-    unsigned long vm_flags;
-    // struct page_cgroup *pc;
-    struct page *page = NULL;
-    int hot = 0, ksm = 0;
-    struct mem_cgroup *memcg;
-    for (i = 0; i < 32; i++)
+    struct rmap_item *rmap_item;
+
+    while (*rmap_list)
     {
-        for (j = 0; j < 16; j++)
-        {
-            page = pfn_to_page(start + i + 32 * j);
-
-            // pc = lookup_page_cgroup(page);
-            // page_referenced(page, 0, sc->target_mem_cgroup, &vm_flags);
-            // if (page_referenced(page, 0, pc, &vm_flags))
-            memcg= page->mem_cgroup;
-            if (page_referenced(page, 0, memcg, &vm_flags))
-                hot++;
-            if (PageKsm(page))
-                ksm++;
-        }
-
-        if ((hot - ksm) < 3 * (i + 1))
+        rmap_item = *rmap_list;
+        if ((rmap_item->address & PAGE_MASK) == addr)
+            return rmap_item;
+        if (rmap_item->address > addr)
             break;
+        *rmap_list = rmap_item->rmap_list;
+        // free_rmap_item(rmap_item);
     }
 
-    // printk("<0>""hot:%d ksm:%d\n",hot,ksm);
-    return hot - ksm;
-}
-
-/*
- * Calculate skip age for the ksm page age. The age determines how often
- * de-duplicating has already been tried unsuccessfully. If the age is
- * smaller, the scanning of this page is skipped for less scans.
- *
- * @age: rmap_item age of page
- */
-static unsigned int skip_age(rmap_age_t age)
-{
-	if (age <= 3)
-		return 1;
-	if (age <= 5)
-		return 2;
-	if (age <= 8)
-		return 4;
-
-	return 8;
-}
-
-/*
- * Determines if a page should be skipped for the current scan.
- *
- * @page: page to check
- * @rmap_item: associated rmap_item of page
- */
-static bool should_skip_rmap_item(struct page *page,
-				  struct rmap_item *rmap_item)
-{
-	rmap_age_t age;
-
-	/*
-	 * Never skip pages that are already KSM; pages cmp_and_merge_page()
-	 * will essentially ignore them, but we still have to process them
-	 * properly.
-	 */
-	if (PageKsm(page))
-		return false;
-
-	age = rmap_item->age;
-	if (age != U8_MAX)
-		rmap_item->age++;
-
-	/*
-	 * Smaller ages are not skipped, they need to get a chance to go
-	 * through the different phases of the KSM merging.
-	 */
-	if (age < 3)
-		return false;
-
-	/*
-	 * Are we still allowed to skip? If not, then don't skip it
-	 * and determine how much more often we are allowed to skip next.
-	 */
-	if (!rmap_item->remaining_skips) {
-		rmap_item->remaining_skips = skip_age(age);
-		return false;
-	}
-
-	/* Skip this page */
-	rmap_item->remaining_skips--;
-	remove_rmap_item_from_tree(rmap_item);
-	return true;
+    rmap_item = alloc_rmap_item();
+    if (rmap_item)
+    {
+        /* It has already been zeroed */
+        rmap_item->mm = mm_slot->mm;
+        rmap_item->address = addr & PAGE_MASK;
+        rmap_item->rmap_list = *rmap_list;
+        *rmap_list = rmap_item;
+        rmap_item->head_item = NULL;
+        rmap_item->was_huge = 0;
+        rmap_item->oldchecksum = 0;
+        rmap_item->hit = false;
+        rmap_item->sleep = 0;
+    }
+    return rmap_item;
 }
 
 static struct rmap_item *scan_get_next_rmap_item(struct page **page)
@@ -2776,16 +2429,12 @@ static struct rmap_item *scan_get_next_rmap_item(struct page **page)
 	struct vm_area_struct *vma;
 	struct rmap_item *rmap_item;
 	int nid;
-	unsigned int inter;
-	unsigned long end_addr;
-	unsigned long page_addr_delta;
 
 	if (list_empty(&ksm_mm_head.mm_list))
 		return NULL;
 
 	slot = ksm_scan.mm_slot;
 	if (slot == &ksm_mm_head) {
-		// advisor_start_scan();
 		/*
 		 * A number of pages can hang around indefinitely on per-cpu
 		 * pagevecs, raised page count preventing write_protect_page
@@ -2834,28 +2483,6 @@ static struct rmap_item *scan_get_next_rmap_item(struct page **page)
 next_mm:
 		ksm_scan.address = 0;
 		ksm_scan.rmap_list = &slot->rmap_list;
-// 		struct hlist_node *tmp_node;
-// 		popl_node_t *popl_node;
-// 		int bkt = 0;
-// 		// update popl_nodes
-// 		spin_lock(&slot->mm->libra_poplmap_lock);
-// 		hash_for_each_safe(slot->mm->popl_table, bkt, tmp_node,
-// 				popl_node, phash_node ) {
-// 			if (unlikely(!popl_node))
-// 				continue;
-// 			popl_node->all_share+=popl_node->this_share;
-// // 			trace_printk("all_each: addr=%lu, meet:%d, hash_active=%d, zeros=%d\
-// // ,small_age=%d, huge_age=%d, flags=%d, share=%d, cows=%d\n", 
-// // 				popl_node->addr,popl_node->already_meet, 
-// // 				popl_node->hash_active, popl_node->zeros, 
-// // 				popl_node->small_age, popl_node->huge_age,
-// // 				popl_node->flags,popl_node->all_share,
-// // 				popl_node->cows);
-// 			popl_node->hash_active=0;
-// 			popl_node->this_share=0;
-// 			popl_node->zeros=0;
-// 		}
-// 		spin_unlock(&slot->mm->libra_poplmap_lock);
 	}
 
 	mm = slot->mm;
@@ -2868,49 +2495,15 @@ next_mm:
 	for (; vma; vma = vma->vm_next) {
 		if (!(vma->vm_flags & VM_MERGEABLE))
 			continue;
-		// if (vma->cows > 128 || vma->cows*3 > vma->ksms) {
-		// 	trace_printk("skip\n");
-		// 	continue;
-		// }
-		// 	if (ksm_scan.address < hstart)
-		// 		ksm_scan.address = hstart;
-		// 	if (!vma->anon_vma)
-		// 		ksm_scan.address = vma->vm_end;
-		// 	end_addr = hend;
-		// 	page_addr_delta=HPAGE_PMD_SIZE;
-		// }else{
 		if (ksm_scan.address < vma->vm_start)
 			ksm_scan.address = vma->vm_start;
 		if (!vma->anon_vma)
 			ksm_scan.address = vma->vm_end;
-		// 	end_addr=vma->vm_end;
-		// 	page_addr_delta=PAGE_SIZE;
-		// }
 
-		/*use inter to sample small  vma & page*/
-		// if ((vma->vm_end-vma->vm_start)<512*PAGE_SIZE)
-		// 	*LARGE_VMA=false;
-		// else
-		// 	*LARGE_VMA=true;
-
-		// if (is_sample&&
-		// ksm_scan.address == vma->vm_start&& 
-		// slot->sample_start<inter_inter && 
-		// ksm_scan.address+(slot->sample_start*PAGE_SIZE)<vma->vm_end){
-		// 	ksm_scan.address += (slot->sample_start)*PAGE_SIZE;
-		// }
-		
-		// if (is_sample){
-		// 	slot->sample_start=(slot->sample_start+1)%inter_inter;
-		// 	inter = inter_inter;
-		// }else 
-		// 	inter = 1;
-		
 		while (ksm_scan.address < vma->vm_end) {
 			if (ksm_test_exit(mm))
 				break;
 			*page = follow_page(vma, ksm_scan.address, FOLL_GET);
-			// trace_printk("dedup:seq%lu\n", ksm_scan.seqnr);
 			if (IS_ERR_OR_NULL(*page)) {
 				ksm_scan.address += PAGE_SIZE;
 				cond_resched();
@@ -2922,18 +2515,14 @@ next_mm:
 				rmap_item = get_next_rmap_item(slot,
 					ksm_scan.rmap_list, ksm_scan.address);
 				if (rmap_item) {
-					rmap_item->vma=vma;
 					ksm_scan.rmap_list =
 							&rmap_item->rmap_list;
-					// if (should_skip_rmap_item(*page, rmap_item))
-					// 	goto next_page;
 					ksm_scan.address += PAGE_SIZE;
 				} else
 					put_page(*page);
 				mmap_read_unlock(mm);
 				return rmap_item;
 			}
-next_page:
 			put_page(*page);
 			ksm_scan.address += PAGE_SIZE;
 			cond_resched();
@@ -2948,10 +2537,7 @@ next_page:
 	 * Nuke all the rmap_items that are above this current rmap:
 	 * because there were no VM_MERGEABLE vmas with such addresses.
 	 */
-	// if (is_sample)
-	// 	remove_trailing_unstable_rmap_items(slot,ksm_scan.rmap_list);
-	// else
-		remove_trailing_rmap_items(slot, ksm_scan.rmap_list);
+	remove_trailing_rmap_items(slot, ksm_scan.rmap_list);
 
 	spin_lock(&ksm_mmlist_lock);
 	ksm_scan.mm_slot = list_entry(slot->mm_list.next,
@@ -2991,24 +2577,6 @@ next_page:
 	if (slot != &ksm_mm_head)
 		goto next_mm;
 
-	// advisor_stop_scan();
-	if (n_pages==0) {
-		n_pages=1;
-	}
-	if (sn_pages==0) {
-		sn_pages=1;
-	}
-	if (hn_pages==0) {
-		hn_pages=1;
-	}
-	if (max_npages<n_pages) {
-		max_npages=n_pages;
-	}
-	trace_printk("seq=%lu, npages=%d, snpages=%d, hnpages=%d, shares_all=%d, shares_p=%d, hots_all=%d, hots_p=%d\n",
-		ksm_scan.seqnr, n_pages, sn_pages, hn_pages,
-		P_shares/n_pages, P_shares/sn_pages, P_hots/n_pages, P_hots/hn_pages);
-	P_shares=P_hots=0;
-	n_pages=hn_pages=sn_pages=1;
 	ksm_scan.seqnr++;
 	return NULL;
 }
@@ -3038,7 +2606,8 @@ static struct rmap_item *my_scan_get_next_rmap_item(struct page **page)
 		 */
 		lru_add_drain_all();
 
-	
+		
+
 		spin_lock(&ksm_mmlist_lock);
 		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
 		merge_scan.mm_slot = slot;
@@ -3121,551 +2690,281 @@ next_mm:
 		goto next_mm;
 
 	merge_scan.seqnr++;
-	ksm_scan.seqnr++;
     merge_count = 30;
 	return NULL;
 }
 
-static struct mm_struct *sample_scan_get_next_page(struct page **page)
+
+/*
+// by guofan
+int merge_into_hugepage(struct page *head, unsigned long address, struct vm_area_struct *vma)
 {
-	struct mm_struct *mm;
-	struct mm_slot *slot;
-	struct vm_area_struct *vma;
-	int nid;
+    pmd_t *pmd, entry;
+    pte_t *pte;
+    struct zone *zone = page_zone(head);
+    struct mm_struct *mm = vma->vm_mm;
+    spinlock_t *ptl, *pmd_ptl;
+    int ret = 0, i, j, start = page_to_pfn(head);
+    struct page *page;
+    pgtable_t pgtable, new_pgtable;
+    unsigned long scan_addr = 0;
 
-	if (list_empty(&ksm_mm_head.mm_list))
-		return NULL;
+    pmd = mm_find_pmd(mm, address);
+    pmd_ptl = pmd_lock(mm, pmd);
+    pte = pte_offset_map_lock(mm, pmd, address, &ptl);
+    pgtable = pmd_pgtable(*pmd);
+    pmdp_invalidate(vma, address, pmd);
 
-	slot = ksm_scan.mm_slot;
-	if (slot == &ksm_mm_head) {
-		lru_add_drain_all();
+    if (page_count(head) != 2)
+        goto out_unlock;
+    mark_page_accessed(head);
+    if (page_mapcount(head) != 1)
+        goto out_unlock;
 
-		spin_lock(&ksm_mmlist_lock);
-		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
-		ksm_scan.mm_slot = slot;
-		spin_unlock(&ksm_mmlist_lock);
+    for (j = 1; j < 512; j++)
+    {
+        page = pfn_to_page(start + j);
+        scan_addr = page_address_in_vma(page, vma);
+        if (scan_addr == -EFAULT)
+            goto out_unlock;
+        scan_addr = scan_addr & PAGE_MASK;
+        if ((scan_addr - address) != PAGE_SIZE * j)
+            goto out_unlock;
+        if (page_mapcount(page) != 1)
+            goto out_unlock;
+        if (page_count(page) != 1)
+            goto out_unlock;
+        mark_page_accessed(page);
+    }
 
-		if (slot == &ksm_mm_head)
-			return NULL;
-next_mm:
-		ksm_scan.address = 0;
-	}
+    for (i = 1; i < 512; i++)
+    {
+        page = pfn_to_page(start + i);
 
-	mm = slot->mm;
-	mmap_read_lock(mm);
-	if (ksm_test_exit(mm))
-		vma = NULL;
-	else
-		vma = find_vma(mm, ksm_scan.address);
+        page->flags &= ~((1L << PG_active) | (1L << PG_lru) | (1L << PG_referenced) | (1L << PG_swapbacked) | (1L << PG_mlocked) | (1L << PG_uptodate) | (1L << PG_active) | (1L << PG_unevictable) | (1L << PG_dirty));
+        smp_wmb();
 
-	for (; vma; vma = vma->vm_next) {
-		if (!(vma->vm_flags & VM_MERGEABLE))
-			continue;
-		if (ksm_scan.address < vma->vm_start)
-			ksm_scan.address = vma->vm_start;
-		if (!vma->anon_vma)
-			ksm_scan.address = vma->vm_end;
-		
-		while (ksm_scan.address < vma->vm_end) {
-			if (ksm_test_exit(mm))
-				break;
-			*page = follow_page(vma, ksm_scan.address, FOLL_GET);
-			if (IS_ERR_OR_NULL(*page)) {
-				ksm_scan.address += PAGE_SIZE;
-				cond_resched();
-				continue;
-			}
-			if (PageAnon(*page)) {
-				flush_anon_page(vma, *page, ksm_scan.address);
-				flush_dcache_page(*page);
-				ksm_scan.address += PAGE_SIZE;
-				mmap_read_unlock(mm);
-				return mm;
-			}
-			put_page(*page);
-			ksm_scan.address += PAGE_SIZE;
-			cond_resched();
-		}
-	}
+        page->mapping = NULL;
+        list_del(&page->lru);
+    }
 
-	if (ksm_test_exit(mm)) {
-		ksm_scan.address = 0;
-	}
+    prep_compound_page(head, 9);
+    __mod_zone_page_state(zone, NR_ANON_TRANSPARENT_HUGEPAGES, 1);
 
-	spin_lock(&ksm_mmlist_lock);
-	ksm_scan.mm_slot = list_entry(slot->mm_list.next,
-						struct mm_slot, mm_list);
-	if (ksm_scan.address == 0) {
+    for (i = 1; i < 512; i++)
+    {
+        page = pfn_to_page(start + i);
+        atomic_set(&page->_mapcount, -1);
+        atomic_set(&page->_count, 0);
+    }
 
-		hash_del(&slot->link);
-		list_del(&slot->mm_list);
-		spin_unlock(&ksm_mmlist_lock);
+    entry = mk_pmd(head, vma->vm_page_prot);
+    entry = pmd_mkhuge(entry);
+    entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+    if (pte_numa(*pte))
+        entry = pmd_mknuma(entry);
+    pmdp_clear_flush(vma, address, pmd);
+    set_pmd_at(mm, address, pmd, entry);
 
-		free_mm_slot(slot);
-		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
-		mmap_read_unlock(mm);
-		mmdrop(mm);
-	} else {
-		mmap_read_unlock(mm);
+    pte_unmap_unlock(pte, ptl);
+    new_pgtable = pte_alloc_one(mm, address);
+    pgtable_trans_huge_deposit(mm, pmd, new_pgtable);
+    pgtable_page_dtor(pgtable);
+    paravirt_release_pte(page_to_pfn(pgtable));
 
-		spin_unlock(&ksm_mmlist_lock);
-	}
+    test_and_clear_bit(_PAGE_BIT_SPLITTING, (unsigned long *)pmd);
+    BUG_ON(pmd_trans_splitting(*pmd));
+    ret = 1;
+    goto out;
 
-	/* Repeat until we've completed scanning the whole list */
-	slot = ksm_scan.mm_slot;
-	if (slot != &ksm_mm_head)
-		goto next_mm;
-	
-	ksm_scan.seqnr++;
-	return NULL;
+out_unlock:
+    pte_unmap_unlock(pte, ptl);
+
+out:
+    spin_unlock(pmd_ptl);
+    return ret;
+}*/
+
+// by guofan
+int cal_hot(struct page *head)
+{
+    int i = 0, j = 0, start = page_to_pfn(head);
+    unsigned long vm_flags;
+    // struct page_cgroup *pc;
+    struct page *page = NULL;
+    int hot = 0, ksm = 0;
+    struct mem_cgroup *memcg;
+    for (i = 0; i < 32; i++)
+    {
+        for (j = 0; j < 16; j++)
+        {
+            page = pfn_to_page(start + i + 32 * j);
+
+            // pc = lookup_page_cgroup(page);
+            // page_referenced(page, 0, sc->target_mem_cgroup, &vm_flags);
+            // if (page_referenced(page, 0, pc, &vm_flags))
+            memcg= page->mem_cgroup;
+            if (page_referenced(page, 0, memcg, &vm_flags))
+                hot++;
+            if (PageKsm(page))
+                ksm++;
+        }
+
+        if ((hot - ksm) < 3 * (i + 1))
+            break;
+    }
+
+    // printk("<0>""hot:%d ksm:%d\n",hot,ksm);
+    return hot - ksm;
 }
 
-static void sample_do_scan(int scan_npages, int change){
-	struct page *page;
-	struct page *page1;
-	u32 subhash;
-	int start = 0, i=0, i_start=0, j1=0,j2=0, k=0;
-	int match, match_count;
-	unsigned long addr;
-	unsigned long h_addr;
-	popl_node_t *popl_node;
-	struct mm_struct *mm=NULL;
+static int check_and_set_bitmap(int i, int flag)
+{
 
-	while (scan_npages-- && likely(!freezing(current))) {
-		if (!likely(!freezing(current)))
-			break;
-		cond_resched();
-
-		mm=sample_scan_get_next_page(&page);
-		if (!mm || !page) 
-			return;
-		addr = ksm_scan.address;
-		h_addr = HPAGE_ALIGN_FLOOR(addr);
-		popl_node = libra_popl_node_lookup(mm, h_addr);
-		if (!popl_node){
-			popl_node = libra_popltable_node_alloc();
-			libra_popl_node_insert(mm, 
-				h_addr, popl_node);
-		}
-		start = i=i_start=j1=j2=k=0;
-
-		if (page && PageHead(page)){
-			if (PageTransCompound(page)) {
-				if (popl_node&& popl_node->already_meet) {
-					popl_node->hash_active=0;
-					popl_node->zeros=0;
-				}
-				start = page_to_pfn(page);
-				match_count=0;
-				i = (popl_node->last_istart += sample_inter/2)%512;
-				i_start = i;
-				while (k<(512/(sample_inter+inter_inter))) {
-					if ((i - i_start + 512) % 512 == sample_inter) {
-						i = (i+inter_inter)%512;
-						i_start = i;
-						k++;
-						if (k>=(512/(sample_inter+inter_inter)))
-							break;
-					}
-					page1 = pfn_to_page(start+i);
-					match = 1;
-					subhash = calc_checksum(page1);
-					if((i - i_start + 512) % 512 < sample_inter/2){
-						// trace_printk("hashj1=%u\n",popl_node->hash_array[j1]);
-						if (popl_node->hash_array[j1]!=0 &&
-						popl_node->hash_array[j1] != subhash)
-								popl_node->hash_active++;
-						j1++;
-					}else{
-						popl_node->hash_array[j2] = subhash;
-						// trace_printk("hashj2=%u\n",popl_node->hash_array[j2]);
-						j2++;
-					}
-
-					if (subhash==ksm_zero_hash)
-						popl_node->zeros++;
-					if (!check_and_set_bitmap(subhash & 0x03FFFFFF, 
-							popl_node->already_meet))
-						match = 0;
-					if (!check_and_set_bitmap(subhash >> 3 & 0x03FFFFFF, 
-							popl_node->already_meet))
-						match = 0;
-					if (!check_and_set_bitmap(subhash >> 6 & 0x03FFFFFF, 
-							popl_node->already_meet))
-						match = 0;
-					match_count += match;
-					i = (i+1)%512;
-				}
-
-				/*more count to dedup, check age here*/
-				if (match_count>(512/((sample_inter+inter_inter)/sample_inter))/16||
-				match_count+popl_node->zeros-popl_node->hash_active >= 0||
-				// popl_node->huge_age>=2&&
-				popl_node->hash_active<(512/((sample_inter+inter_inter)/sample_inter))/(2*2)||
-				popl_node->zeros>(512/((sample_inter+inter_inter)/sample_inter))/8||
-				popl_node->hash_active==(512/((sample_inter+inter_inter)/sample_inter))/2)
-					popl_node->flags = P_NEED_SPLIT;
-				/*less count to collapse, check age here*/
-				else if (!popl_node->list_flag && popl_node->hash_active>(512/((sample_inter+inter_inter)/sample_inter))/(2*2)){
-					popl_node->flags = P_NEED_COLLAPSE;
-				}
-// 				trace_printk("seq%lu, meet:%d, match_count:%d, hash_active:%d, zeros:%d, \
-// flags=%d, share=%d, cows=%d\n", 
-// 					ksm_scan.seqnr, popl_node->already_meet, 
-// 					match_count, popl_node->hash_active,
-// 					popl_node->zeros, popl_node->flags,
-// 					popl_node->all_share, popl_node->cows);
-				popl_node->already_meet=1;
-			}else {
-				if (popl_node->cows < 256 || popl_node->all_share>16) 
-					popl_node->flags=P_NEED_SPLIT;
-				else if (popl_node->cows>=512){
-					popl_node->cows/=2;
-					popl_node->flags=P_NEED_COLLAPSE;
-					spin_lock(&popl_list_lock);
-					// trace_printk("add list, popl.addr:%lu\n",popl_node->addr);
-					list_add(&popl_node->popl_l, &popl_list);
-					popl_node->list_flag=1;
-					spin_unlock(&popl_list_lock);
-				}
-			}
-			ksm_scan.address+=PAGE_SIZE*511;
-		}
-	}
-
+    if (!flag)
+    {
+        if (test_bitmap(i, bitmap1))
+        {
+            set_bitmap(i, bitmap2);
+            return 1;
+        }
+        else
+        {
+            set_bitmap(i, bitmap1);
+            return 0;
+        }
+    }
+    else
+    {
+        if (test_bitmap(i, bitmap2))
+            return 1;
+        else
+            return 0;
+    }
 }
+
+
 /**
  * ksm_do_scan  - the ksm scanner main worker function.
  * @scan_npages:  number of pages we want to scan before we return.
  */
-static void ksm_do_scan(int scan_npages)
+static void ksm_do_scan(unsigned int scan_npages)
 {
 	struct rmap_item *rmap_item;
-	struct page *page;
-	struct page *page1;
-	u32 subhash;
-	int start = 0, i=0, i_start=0, j1=0,j2=0, k=0;
-	int match, match_count;
-	unsigned long addr;
-	unsigned long h_addr;
-	popl_node_t *popl_node;
-	struct mm_struct *mm=NULL;
-	unsigned int checksum;
-    int is_old = 0;
-	struct mem_cgroup *memcg;
-	struct vm_area_struct *vma;
-	unsigned long vm_flags;
+	struct page *page, *page1=NULL;
+    unsigned int checksum;
+    int i, start, match_count, match, is_old = 0;
 
 	while (scan_npages-- && likely(!freezing(current))) {
-		if (!likely(!freezing(current)))
-			break;
 		cond_resched();
 		rmap_item = scan_get_next_rmap_item(&page);
 		if (!rmap_item)
 			return;
 
-        // pc = lookup_page_cgroup(page);
-        // memcg=page->mem_cgroup;
+        if (PageHead(page) && !(rmap_item->was_huge))
+        {
+            ksm_scan.address += PAGE_SIZE * 511;
+            put_page(page);
+            continue;
+        }
+        else if (PageHead(page) && rmap_item->was_huge == 1)
+        {
+            if (!(rmap_item->head_item))
+                goto out;
+            start = page_to_pfn(page);
+            match_count = 0;
+            if (!rmap_item->head_item->firstcheck)
+            {
+                for (i = 0; i < 512; i++)
+                {
+                    match = 1;
+                    page1 = pfn_to_page(start + i);
+                    checksum = calc_checksum(page1);
+                    if (!check_and_set_bitmap(checksum & 0x03FFFFFF, 0))
+                        match = 0;
+                    if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 0))
+                        match = 0;
+                    if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 0))
+                        match = 0;
+                    match_count += match;
+                }
+                rmap_item->head_item->firstcheck = 1;
+                if (match_count > 32)
+                {
+                    rmap_item->was_huge = 2;
+                    goto out2;
+                }
+            }
+            else
+            {
+                for (i = 0; i < 32; i++)
+                {
+                    match = 1;
+                    page1 = pfn_to_page(start + i * 16);
+                    checksum = calc_checksum(page1);
+                    if (!check_and_set_bitmap(checksum & 0x03FFFFFF, 1))
+                        match = 0;
+                    if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 1))
+                        match = 0;
+                    if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 1))
+                        match = 0;
+                    match_count += match;
+                }
+                if (match_count > 4)
+                {
+                    rmap_item->was_huge = 2;
+                    goto out2;
+                }
+            }
+        out:
+            ksm_scan.address += PAGE_SIZE * 511;
+            // scan_npages-=300;
+            put_page(page);
+            continue;
+        }
 
-		// if (!change){
-		// 	if (PageHead(page) && !(rmap_item->was_huge)){
-		// 		ksm_scan.address += PAGE_SIZE * 511;
-		// 		put_page(page);
-		// 		continue;
-		// 	}else if (PageHead(page) && rmap_item->was_huge == 1){
-		// 		if (!(rmap_item->head_item))
-		// 			goto out;
-		// 		start = page_to_pfn(page);
-		// 		match_count = 0;
-		// 		if (!rmap_item->head_item->firstcheck){
-		// 			for (i = 0; i < 512; i++){
-		// 				match = 1;
-		// 				page1 = pfn_to_page(start + i);
-		// 				checksum = calc_checksum(page1);
-		// 				if (!check_and_set_bitmap(checksum & 0x03FFFFFF, 0))
-		// 					match = 0;
-		// 				if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 0))
-		// 					match = 0;
-		// 				if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 0))
-		// 					match = 0;
-		// 				match_count += match;
-		// 			}
-		// 			rmap_item->head_item->firstcheck = 1;
-		// 			if (match_count > 32){
-		// 				rmap_item->was_huge = 2;
-		// 				goto out2;
-		// 			}
-		// 		}else{
-		// 			for (i = 0; i < 32; i++){
-		// 				match = 1;
-		// 				page1 = pfn_to_page(start + i * 16);
-		// 				checksum = calc_checksum(page1);
-		// 				if (!check_and_set_bitmap(checksum & 0x03FFFFFF, 1))
-		// 					match = 0;
-		// 				if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 1))
-		// 					match = 0;
-		// 				if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 1))
-		// 					match = 0;
-		// 				match_count += match;
-		// 			}
-		// 			if (match_count > 4){
-		// 				rmap_item->was_huge = 2;
-		// 				goto out2;
-		// 			}
-		// 		}
-		// 	out:
-		// 		ksm_scan.address += PAGE_SIZE * 511;
-		// 		// scan_npages-=300;
-		// 		put_page(page);
-		// 		continue;
-		// 	}
-		// out2:
-		// 	if (rmap_item->hit)
-		// 		cmp_and_merge_page(page, rmap_item,1);
-		// 	else{
-		// 		is_old = 1;
-		// 		if (!rmap_item->sleep){
-		// 			checksum = calc_checksum(page);
-		// 			if (rmap_item->oldchecksum == checksum)
-		// 				rmap_item->sleep = 3;
-		// 			else
-		// 				is_old = 0;
-		// 		}
-		// 		else{
-		// 			rmap_item->sleep--;
-		// 			checksum = rmap_item->oldchecksum;
-		// 		}
-		// 		match = 1;
-		// 		if (!check_and_set_bitmap(checksum & 0x03FFFFFF, 1))
-		// 			match = 0;
-		// 		if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 1))
-		// 			match = 0;
-		// 		if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 1))
-		// 			match = 0;
-		// 		if (match){
-		// 			rmap_item->hit = true;
-		// 			rmap_item->oldchecksum = checksum;
-		// 			cmp_and_merge_page(page, rmap_item, 1);
-		// 		}
-		// 		else{
-		// 			rmap_item->oldchecksum = checksum;
-		// 		}
-		// 	}
-		// 	put_page(page);
-		// //-----------------------------------------
-		// }else{
-
-
-			if (PageHead(page) && PageTransCompound(page)) {
-				// addr = rmap_item->address;
-				// h_addr = HPAGE_ALIGN_FLOOR(addr);
-				// popl_node = libra_popl_node_lookup(rmap_item->mm, h_addr);
-				// if (popl_node){
-				// 	rmap_item->popl = popl_node;
-				// 	if (popl_node->flags==P_NEED_COLLAPSE && PageTransCompound(page)) {
-				// 		ksm_scan.address+=PAGE_SIZE*511;
-				// 		trace_printk("1\n");
-				// 		goto out1;
-				// 	}else if (popl_node->cows<100) 
-				// 		popl_node->flags=P_NEED_SPLIT;
-				// }else 
-					// if (rmap_item->was_huge == 1){
-				if (!(rmap_item->head_item))
-				{
-					rmap_item->head_item = alloc_head_item();
-					if (!(rmap_item->head_item)){
-						trace_printk("no space, ...\n");
-						ksm_scan.address+=PAGE_SIZE*511;
-						if (scan_npages>511) 
-							scan_npages-=511;
-						else 
-							scan_npages=0;
-						goto out1;
-					}
-					rmap_item->head_item->hot = (lru_bound + 1) / 2;
-					rmap_item->head_item->rmap_item = rmap_item;
-					rmap_item->head_item->rank = page_rank;
-					rmap_item->head_item->firstcheck = 0;
-					rmap_item->head_item->checkage = 0;
-					rmap_item->head_item->checknum = 0;
-					rmap_item->head_item->peaceage = 0;
-
-					start = page_to_pfn(page);
-					for (i = 0; i < 512; i++)
-					{
-						page1 = pfn_to_page(start + i );
-						checksum = calc_checksum(page1);
-						if(i%(512/PO_HASH_SIZE)==0)
-							rmap_item->head_item->hash_array[i/(512/PO_HASH_SIZE)]=checksum;
-						check_and_set_bitmap(checksum & 0x03FFFFFF, 0);
-						check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 0);
-						check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 0);
-					}
-					ksm_scan.address+=PAGE_SIZE*511;
-					if (scan_npages>511) 
-						scan_npages-=511;
-					else 
-						scan_npages=0;
-					goto out1;
-				}
-				
-				switch (page_referenced(page, 1, memcg, &vm_flags))
-				{
-				case 0:
-					if (ksm_scan.seqnr % 2 == 1)
-						rmap_item->head_item->hot--;
-					break;
-				default:
-					if (ksm_scan.seqnr % 2 == 1)
-						rmap_item->head_item->hot++;
-					break;
-				}
-
-				if (rmap_item->head_item->hot > lru_bound)
-					rmap_item->head_item->hot = lru_bound;
-				if (rmap_item->head_item->hot < 0)
-					rmap_item->head_item->hot = 0;
-			
-				if (rmap_item->head_item->hot==0) {
-					// rmap_item->head_item->peaceage=3;
-					// trace_printk("-1\n");
-					goto outk;
-				}
-
-				if (rmap_item->head_item->checkage>=3) {
-					rmap_item->head_item->checkage--;
-					// trace_printk("age=%u, 0\n", rmap_item->head_item->checkage);
-					ksm_scan.address+=PAGE_SIZE*511;
-					if (scan_npages>511) 
-						scan_npages-=511;
-					else 
-						scan_npages=0;
-					goto out1;
-				}
-
-				start = page_to_pfn(page);
-				match_count = 0;
-				for (i = 0; i < PO_HASH_SIZE; i++){
-					match = 1;
-					page1 = pfn_to_page(start + i * (512/PO_HASH_SIZE));
-					checksum = calc_checksum(page1);
-					if (!check_and_set_bitmap(checksum & 0x03FFFFFF, rmap_item->head_item->firstcheck))
-						match = 0;
-					if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, rmap_item->head_item->firstcheck))
-						match = 0;
-					if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, rmap_item->head_item->firstcheck))
-						match = 0;
-					match_count += match;
-					if (rmap_item->head_item->hash_array[i]!=checksum) {
-						rmap_item->head_item->checknum++;
-						rmap_item->head_item->hash_array[i]=checksum;
-					}
-				}
-
-				rmap_item->head_item->firstcheck = 1;
-				if (match_count>0) {
-					sn_pages++;
-				}
-				if (rmap_item->head_item->checknum>0) {
-					hn_pages++;
-				}
-				n_pages++;
-				P_shares+=match_count;
-				P_hots+=rmap_item->head_item->checknum;
-				// trace_printk("checknum:%d, checkage:%d, peace_age:%d\n", 
-				// 	rmap_item->head_item->checknum, 
-				// 		rmap_item->head_item->checkage, 
-				// 			rmap_item->head_item->peaceage);
-
-				if (match_count>0) {
-					if (rmap_item->head_item->checknum>0) {
-						//skip
-						rmap_item->head_item->checkage++;
-
-						// if (rmap_item->head_item->peaceage>=3) 
-						// 	rmap_item->head_item->peaceage-=3;
-						//Dcv_th 32
-						if (rmap_item->head_item->checkage>=2 || rmap_item->head_item->checknum>=process_th)
-							rmap_item->head_item->peaceage=0;
-						
-						// trace_printk("checknum=%u, 1\n", rmap_item->head_item->checknum);
-						rmap_item->head_item->checknum=0;
-						ksm_scan.address+=PAGE_SIZE*511;
-						if (scan_npages>511) 
-							scan_npages-=511;
-						else 
-							scan_npages=0;
-						goto out1;
-					}else{
-						//wait
-						rmap_item->head_item->peaceage++;
-						//peace_th 6
-						if (rmap_item->head_item->peaceage<=peace_th) {
-							// trace_printk("checknum=%u, 2\n", rmap_item->head_item->checknum);
-							rmap_item->head_item->checknum=0;
-							ksm_scan.address+=PAGE_SIZE*511;
-							if (scan_npages>511) 
-								scan_npages-=511;
-							else 
-								scan_npages=0;
-							goto out1;
-						}else {
-							//dedup
-							trace_printk("checknum=%u, 3\n", rmap_item->head_item->checknum);
-							rmap_item->head_item->checknum=0;
-							cmp_and_merge_page(page, rmap_item, 1);
-							goto out1;
-						}
-					}
-				}else {
-					ksm_scan.address+=PAGE_SIZE*511;
-					if (scan_npages>511) 
-						scan_npages-=511;
-					else 
-						scan_npages=0;
-					goto out1;
-				}
-				
-			}else{
-				//splited page
-				if (PageHead(page)&&rmap_item->head_item) {
-					rmap_item->head_item->peaceage=2;
-					rmap_item->head_item->checkage=0;
-					//restore
-					if (cal_hot(page) > 128) {
-						ksm_scan.address+=PAGE_SIZE*511;
-						goto out1;
-					}
-					if (rmap_item->vma && rmap_item->vma->cows>0 && cal_hot(page)>0) {
-						addr = rmap_item->address;
-						h_addr = HPAGE_ALIGN_FLOOR(addr);
-						popl_node = libra_popl_node_lookup(mm, h_addr);
-						if (!popl_node){
-							popl_node = libra_popltable_node_alloc();
-							libra_popl_node_insert(mm, 
-								h_addr, popl_node);
-						}
-						popl_node->flags=P_NEED_COLLAPSE;
-						spin_lock(&popl_list_lock);
-						// trace_printk("add list, popl.addr:%lu\n",popl_node->addr);
-						list_add(&popl_node->popl_l, &popl_list);
-						popl_node->list_flag=1;
-						spin_unlock(&popl_list_lock);
-						trace_printk("unmerge: cows:%d\n", rmap_item->vma->cows);
-						unmerge_ksm_pages(rmap_item->vma, rmap_item->address, rmap_item->address+PAGE_SIZE*511);
-						ksm_scan.address+=PAGE_SIZE*511;
-						goto out1;
-					}
-				}
-			}
-outk:
-			cmp_and_merge_page(page, rmap_item, 1);
-out1:
-			put_page(page);
-		// }
+    out2:
+        if (rmap_item->hit)
+            cmp_and_merge_page(page, rmap_item);
+        else
+        {
+            is_old = 1;
+            if (!rmap_item->sleep)
+            {
+                checksum = calc_checksum(page);
+                if (rmap_item->oldchecksum == checksum)
+                    rmap_item->sleep = 3;
+                else
+                    is_old = 0;
+            }
+            else
+            {
+                rmap_item->sleep--;
+                checksum = rmap_item->oldchecksum;
+            }
+            match = 1;
+            if (!check_and_set_bitmap(checksum & 0x03FFFFFF, 1))
+                match = 0;
+            if (!check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 1))
+                match = 0;
+            if (!check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 1))
+                match = 0;
+            if (match)
+            {
+                rmap_item->hit = true;
+                rmap_item->oldchecksum = checksum;
+                cmp_and_merge_page(page, rmap_item);
+            }
+            else
+            {
+                rmap_item->oldchecksum = checksum;
+            }
+        }
+        put_page(page);
 	}
 }
 
+// by guofan
 static void merge_do_scan(unsigned int scan_npages)
 {
     struct rmap_item *rmap_item, *rmap_item1;
@@ -3678,6 +2977,7 @@ static void merge_do_scan(unsigned int scan_npages)
     unsigned long seqnr_begin = merge_scan.seqnr;
     unsigned int checksum;
     struct mem_cgroup *memcg;
+
     while (seqnr_begin == merge_scan.seqnr && likely(!freezing(current)))
     {
         cond_resched();
@@ -3710,14 +3010,13 @@ static void merge_do_scan(unsigned int scan_npages)
             {
                 split = split_huge_page(page);
                 start = page_to_pfn(page);
-                for (i = 0; i < PO_HASH_SIZE; i++)
+                for (i = 0; i < 512; i++)
                 {
-                    page1 = pfn_to_page(start + i * (512/PO_HASH_SIZE));
+                    page1 = pfn_to_page(start + i);
                     checksum = calc_checksum(page1);
-					rmap_item->head_item->hash_array[i]=checksum;
-                    // check_and_set_bitmap(checksum & 0x03FFFFFF, 0);
-                    // check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 0);
-                    // check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 0);
+                    check_and_set_bitmap(checksum & 0x03FFFFFF, 0);
+                    check_and_set_bitmap(checksum >> 3 & 0x03FFFFFF, 0);
+                    check_and_set_bitmap(checksum >> 6 & 0x03FFFFFF, 0);
                 }
                 goto out1;
             }
@@ -3744,18 +3043,15 @@ static void merge_do_scan(unsigned int scan_npages)
 
             if (rmap_item->head_item->hot == 0)
             {
+
                 rmap_item->was_huge = 1;
                 rmap_item->head_item->hot = 0;
                 cold_count++;
             }
 
         out1:
-            merge_scan.address += PAGE_SIZE*511;
-			if (scan_npages>511) {
-				scan_npages-=511;
-			}else{
-				scan_npages=0;
-			}
+            // merge_scan.address += PAGE_SIZE*500;
+            // scan_npages -=300;
             put_page(page);
             continue;
         }
@@ -3825,68 +3121,32 @@ static void merge_do_scan(unsigned int scan_npages)
     }
 }
 
-
 static int ksmd_should_run(void)
 {
 	return (ksm_run & KSM_RUN_MERGE) && !list_empty(&ksm_mm_head.mm_list);
 }
 
-void timer_callback(struct timer_list *timer) {
-    timer_flag = 1;
-    mod_timer(timer, jiffies + msecs_to_jiffies(200000)); // 200 seconds
-}
-
 static int ksm_scan_thread(void *nothing)
 {
 	unsigned int sleep_ms;
-	int pages_to_scan;
 
 	set_freezable();
 	set_user_nice(current, 5);
 
 	while (!kthread_should_stop()) {
-		if (timer_flag) {
-			timer_flag = 0;
-			change++;
-			trace_printk("change\n");
-
-			if ((ksm_pages_sharing/512)< max_npages/2 && change) {
-				if (peace_th>3) {
-					peace_th--;
-				}
-			}
-		}
-
-		ksm_thread_sample_pages_to_scan = ksm_thread_pages_to_scan/2;
-		if (ksm_scan.seqnr%2==0) 
-			pages_to_scan = ksm_thread_sample_pages_to_scan;
-		else
-			pages_to_scan = ksm_thread_pages_to_scan;
-		// trace_printk("ksm_seq%lu\n", ksm_scan.seqnr);
 		mutex_lock(&ksm_thread_mutex);
 		wait_while_offlining();
-		// if (ksmd_should_run()){
-		// 	if (ksm_scan.seqnr%2==0) 
-		// 		merge_do_scan(ksm_thread_pages_to_scan);
-		// 	else
-				ksm_do_scan(ksm_thread_pages_to_scan);
-		// }
+		if (ksmd_should_run())
+			ksm_do_scan(ksm_thread_pages_to_scan);
 		mutex_unlock(&ksm_thread_mutex);
 
 		try_to_freeze();
 
 		if (ksmd_should_run()) {
-			// if (ksm_scan.seqnr%2==0) {
-			// 	sleep_ms = READ_ONCE(ksm_thread_sample_sleep_millisecs);
-			// 	wait_event_interruptible_timeout(ksm_iter_wait,
-			// 		sleep_ms != READ_ONCE(ksm_thread_sample_sleep_millisecs),
-			// 		msecs_to_jiffies(sleep_ms));
-			// }else{
-				sleep_ms = READ_ONCE(ksm_thread_sleep_millisecs);
-				wait_event_interruptible_timeout(ksm_iter_wait,
-					sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
-					msecs_to_jiffies(sleep_ms));
-			// }
+			sleep_ms = READ_ONCE(ksm_thread_sleep_millisecs);
+			wait_event_interruptible_timeout(ksm_iter_wait,
+				sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
+				msecs_to_jiffies(sleep_ms));
 		} else {
 			wait_event_freezable(ksm_thread_wait,
 				ksmd_should_run() || kthread_should_stop());
@@ -3894,6 +3154,7 @@ static int ksm_scan_thread(void *nothing)
 	}
 	return 0;
 }
+
 
 static int merge_scan_thread(void *nothing)
 {
@@ -3906,9 +3167,8 @@ static int merge_scan_thread(void *nothing)
 
         mutex_lock(&ksm_thread_mutex);
         wait_while_offlining();
-        if (ksm_run & KSM_RUN_MERGE){
-			// merge_do_scan(ksm_thread_pages_to_scan);
-		}
+        if (ksm_run & KSM_RUN_MERGE)
+            merge_do_scan(ksm_thread_pages_to_scan);
         mutex_unlock(&ksm_thread_mutex);
 
         try_to_freeze();
@@ -3984,12 +3244,12 @@ int __ksm_enter(struct mm_struct *mm)
 	struct mm_slot *mm_slot;
 	int needs_wakeup;
 
-	mm_slot = alloc_mm_slot();
-	mm_slot->sample_start = 0;
-	page_rank = 0;
+    page_rank = 0;
     cold_count = 0;
     memset(bitmap1, 0, sizeof(int) * (1 + N / BITSPERWORD));
     memset(bitmap2, 0, sizeof(int) * (1 + N / BITSPERWORD));
+
+	mm_slot = alloc_mm_slot();
 	if (!mm_slot)
 		return -ENOMEM;
 
@@ -4051,19 +3311,6 @@ void __ksm_exit(struct mm_struct *mm)
 	}
 	spin_unlock(&ksm_mmlist_lock);
 
-	trace_printk("exit_mm=%lu\n",mm);
-	struct hlist_node *tmp_node;
-	popl_node_t *popl_node;
-	int bkt = 0;
-	// update popl_nodes
-	spin_lock(&mm->libra_poplmap_lock);
-	hash_for_each_safe(mm->popl_table, bkt, tmp_node,
-			popl_node, phash_node ) {
-		if (unlikely(!popl_node))
-			continue;
-		memset(popl_node, 0, sizeof(popl_node_t));
-	}
-	spin_unlock(&mm->libra_poplmap_lock);
 	if (easy_to_free) {
 		free_mm_slot(mm_slot);
 		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
@@ -4072,7 +3319,7 @@ void __ksm_exit(struct mm_struct *mm)
 		mmap_write_lock(mm);
 		mmap_write_unlock(mm);
 	}
-	page_rank = 0;
+    page_rank = 0;
 }
 
 struct page *ksm_might_need_to_copy(struct page *page,
@@ -4184,10 +3431,10 @@ void ksm_migrate_page(struct page *newpage, struct page *oldpage)
 	VM_BUG_ON_PAGE(newpage->mapping != oldpage->mapping, newpage);
 
 	stable_node = page_stable_node(newpage);
-	// stable_node->oldchecksum = calc_checksum(newpage);
 	if (stable_node) {
 		VM_BUG_ON_PAGE(stable_node->kpfn != page_to_pfn(oldpage), oldpage);
 		stable_node->kpfn = page_to_pfn(newpage);
+        stable_node->oldchecksum = calc_checksum(newpage);
 		/*
 		 * newpage->mapping was set in advance; now we need smp_wmb()
 		 * to make sure that the new stable_node->kpfn is visible
@@ -4364,6 +3611,96 @@ static ssize_t sleep_millisecs_store(struct kobject *kobj,
 }
 KSM_ATTR(sleep_millisecs);
 
+static ssize_t merge_sleep_millisecs_show(struct kobject *kobj,
+                                          struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%u\n", merge_sleep_millisecs);
+}
+static ssize_t merge_sleep_millisecs_store(struct kobject *kobj,
+                                           struct kobj_attribute *attr,
+                                           const char *buf, size_t count)
+{
+    unsigned long msecs;
+    int err;
+
+    err = kstrtoul(buf, 10, &msecs);
+    if (err || msecs > UINT_MAX)
+        return -EINVAL;
+
+    merge_sleep_millisecs = msecs;
+
+    return count;
+}
+KSM_ATTR(merge_sleep_millisecs);
+
+static ssize_t merge_sleep_millisecs1_show(struct kobject *kobj,
+                                           struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%u\n", merge_sleep_millisecs1);
+}
+static ssize_t merge_sleep_millisecs1_store(struct kobject *kobj,
+                                            struct kobj_attribute *attr,
+                                            const char *buf, size_t count)
+{
+    unsigned long msecs;
+    int err;
+
+    err = kstrtoul(buf, 10, &msecs);
+    if (err || msecs > UINT_MAX)
+        return -EINVAL;
+
+    merge_sleep_millisecs1 = msecs;
+
+    return count;
+}
+KSM_ATTR(merge_sleep_millisecs1);
+
+static ssize_t small_hot_bound_show(struct kobject *kobj,
+                                    struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%u\n", small_hot_bound);
+}
+
+static ssize_t small_hot_bound_store(struct kobject *kobj,
+                                     struct kobj_attribute *attr,
+                                     const char *buf, size_t count)
+{
+    int err;
+    unsigned long nr_pages;
+
+    err = kstrtoul(buf, 10, &nr_pages);
+    if (err || nr_pages > UINT_MAX)
+        return -EINVAL;
+
+    small_hot_bound = nr_pages;
+
+    return count;
+}
+KSM_ATTR(small_hot_bound);
+
+static ssize_t do_merge_show(struct kobject *kobj,
+                             struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%u\n", do_merge);
+}
+
+static ssize_t do_merge_store(struct kobject *kobj,
+                              struct kobj_attribute *attr,
+                              const char *buf, size_t count)
+{
+    int err;
+    unsigned long nr_pages;
+
+    err = kstrtoul(buf, 10, &nr_pages);
+    if (err || nr_pages > UINT_MAX)
+        return -EINVAL;
+
+    do_merge = nr_pages;
+
+    return count;
+}
+KSM_ATTR(do_merge);
+
 static ssize_t pages_to_scan_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
@@ -4376,9 +3713,6 @@ static ssize_t pages_to_scan_store(struct kobject *kobj,
 {
 	int err;
 	unsigned long nr_pages;
-
-	// if (ksm_advisor != KSM_ADVISOR_NONE)
-	// 	return -EINVAL;
 
 	err = kstrtoul(buf, 10, &nr_pages);
 	if (err || nr_pages > UINT_MAX)
@@ -4417,20 +3751,7 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 	mutex_lock(&ksm_thread_mutex);
 	wait_while_offlining();
-	reset_bitmap();
-	init_zeropage_hash();
-
-	if (ksm_run==1 ) {
-		// 初始化计时器
-		peace_th=6;
-		if (!timer_init) {
-			timer_setup(&my_timer, timer_callback, 0);
-			timer_init=1;
-		}
-		mod_timer(&my_timer, jiffies + msecs_to_jiffies(200000)); // 200 seconds
-		// add_timer(&my_timer);
-	}
-	change=0;
+    reset_bitmap();
 	if (ksm_run != flags) {
 		ksm_run = flags;
 		if (flags & KSM_RUN_UNMERGE) {
@@ -4531,50 +3852,6 @@ static ssize_t use_zero_pages_store(struct kobject *kobj,
 	return count;
 }
 KSM_ATTR(use_zero_pages);
-
-static ssize_t peaceth_show(struct kobject *kobj,
-				struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", peace_th);
-}
-static ssize_t peaceth_store(struct kobject *kobj,
-				   struct kobj_attribute *attr,
-				   const char *buf, size_t count)
-{
-	int err;
-	unsigned long  value;
-
-	err = kstrtol(buf, 10, &value);
-	if (err)
-		return -EINVAL;
-
-	peace_th = value;
-
-	return count;
-}
-KSM_ATTR(peaceth);
-
-static ssize_t processth_show(struct kobject *kobj,
-				struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", process_th);
-}
-static ssize_t processth_store(struct kobject *kobj,
-				   struct kobj_attribute *attr,
-				   const char *buf, size_t count)
-{
-	int err;
-	unsigned long  value;
-
-	err = kstrtol(buf, 10, &value);
-	if (err)
-		return -EINVAL;
-
-	process_th = value;
-
-	return count;
-}
-KSM_ATTR(processth);
 
 static ssize_t max_page_sharing_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *buf)
@@ -4702,132 +3979,27 @@ static ssize_t full_scans_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(full_scans);
 
-// static ssize_t advisor_mode_show(struct kobject *kobj,
-// 				 struct kobj_attribute *attr, char *buf)
-// {
-// 	const char *output;
+static ssize_t full_merge_scans_show(struct kobject *kobj,
+                                     struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%lu\n", merge_scan.seqnr);
+}
+KSM_ATTR_RO(full_merge_scans);
 
-// 	if (ksm_advisor == KSM_ADVISOR_NONE)
-// 		output = "[none] scan-time";
-// 	else if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
-// 		output = "none [scan-time]";
-
-// 	return sysfs_emit(buf, "%s\n", output);
-// }
-
-// static ssize_t advisor_mode_store(struct kobject *kobj,
-// 				  struct kobj_attribute *attr, const char *buf,
-// 				  size_t count)
-// {
-// 	enum ksm_advisor_type curr_advisor = ksm_advisor;
-
-// 	if (sysfs_streq("scan-time", buf))
-// 		ksm_advisor = KSM_ADVISOR_SCAN_TIME;
-// 	else if (sysfs_streq("none", buf))
-// 		ksm_advisor = KSM_ADVISOR_NONE;
-// 	else
-// 		return -EINVAL;
-
-// 	/* Set advisor default values */
-// 	if (curr_advisor != ksm_advisor)
-// 		set_advisor_defaults();
-
-// 	return count;
-// }
-// KSM_ATTR(advisor_mode);
-
-// static ssize_t advisor_max_cpu_show(struct kobject *kobj,
-// 				    struct kobj_attribute *attr, char *buf)
-// {
-// 	return sysfs_emit(buf, "%u\n", ksm_advisor_max_cpu);
-// }
-
-// static ssize_t advisor_max_cpu_store(struct kobject *kobj,
-// 				     struct kobj_attribute *attr,
-// 				     const char *buf, size_t count)
-// {
-// 	int err;
-// 	unsigned long value;
-
-// 	err = kstrtoul(buf, 10, &value);
-// 	if (err)
-// 		return -EINVAL;
-
-// 	ksm_advisor_max_cpu = value;
-// 	return count;
-// }
-// KSM_ATTR(advisor_max_cpu);
-
-// static ssize_t advisor_min_pages_to_scan_show(struct kobject *kobj,
-// 					struct kobj_attribute *attr, char *buf)
-// {
-// 	return sysfs_emit(buf, "%lu\n", ksm_advisor_min_pages_to_scan);
-// }
-
-// static ssize_t advisor_min_pages_to_scan_store(struct kobject *kobj,
-// 					struct kobj_attribute *attr,
-// 					const char *buf, size_t count)
-// {
-// 	int err;
-// 	unsigned long value;
-
-// 	err = kstrtoul(buf, 10, &value);
-// 	if (err)
-// 		return -EINVAL;
-
-// 	ksm_advisor_min_pages_to_scan = value;
-// 	return count;
-// }
-// KSM_ATTR(advisor_min_pages_to_scan);
-
-// static ssize_t advisor_max_pages_to_scan_show(struct kobject *kobj,
-// 					struct kobj_attribute *attr, char *buf)
-// {
-// 	return sysfs_emit(buf, "%lu\n", ksm_advisor_max_pages_to_scan);
-// }
-
-// static ssize_t advisor_max_pages_to_scan_store(struct kobject *kobj,
-// 					struct kobj_attribute *attr,
-// 					const char *buf, size_t count)
-// {
-// 	int err;
-// 	unsigned long value;
-
-// 	err = kstrtoul(buf, 10, &value);
-// 	if (err)
-// 		return -EINVAL;
-
-// 	ksm_advisor_max_pages_to_scan = value;
-// 	return count;
-// }
-// KSM_ATTR(advisor_max_pages_to_scan);
-
-// static ssize_t advisor_target_scan_time_show(struct kobject *kobj,
-// 					     struct kobj_attribute *attr, char *buf)
-// {
-// 	return sysfs_emit(buf, "%lu\n", ksm_advisor_target_scan_time);
-// }
-
-// static ssize_t advisor_target_scan_time_store(struct kobject *kobj,
-// 					      struct kobj_attribute *attr,
-// 					      const char *buf, size_t count)
-// {
-// 	int err;
-// 	unsigned long value;
-
-// 	err = kstrtoul(buf, 10, &value);
-// 	if (err)
-// 		return -EINVAL;
-// 	if (value < 1)
-// 		return -EINVAL;
-
-// 	ksm_advisor_target_scan_time = value;
-// 	return count;
-// }
-// KSM_ATTR(advisor_target_scan_time);
+static ssize_t cold_count_show(struct kobject *kobj,
+                               struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%d\n", cold_count);
+}
+KSM_ATTR_RO(cold_count);
 
 static struct attribute *ksm_attrs[] = {
 	&sleep_millisecs_attr.attr,
+    &merge_sleep_millisecs_attr.attr,
+    &merge_sleep_millisecs1_attr.attr,
+    &small_hot_bound_attr.attr,
+    &do_merge_attr.attr,
+    &cold_count_attr.attr,
 	&pages_to_scan_attr.attr,
 	&run_attr.attr,
 	&pages_shared_attr.attr,
@@ -4835,8 +4007,7 @@ static struct attribute *ksm_attrs[] = {
 	&pages_unshared_attr.attr,
 	&pages_volatile_attr.attr,
 	&full_scans_attr.attr,
-	&peaceth_attr.attr,
-	&processth_attr.attr,
+    &full_merge_scans_attr.attr,
 #ifdef CONFIG_NUMA
 	&merge_across_nodes_attr.attr,
 #endif
@@ -4845,11 +4016,6 @@ static struct attribute *ksm_attrs[] = {
 	&stable_node_dups_attr.attr,
 	&stable_node_chains_prune_millisecs_attr.attr,
 	&use_zero_pages_attr.attr,
-	// &advisor_mode_attr.attr,
-	// &advisor_max_cpu_attr.attr,
-	// &advisor_min_pages_to_scan_attr.attr,
-	// &advisor_max_pages_to_scan_attr.attr,
-	// &advisor_target_scan_time_attr.attr,
 	NULL,
 };
 
@@ -4885,19 +4051,20 @@ static int __init ksm_init(void)
 		goto out_free;
 	}
 
-    // merge_thread = kthread_run(merge_scan_thread, NULL, "my_merge");
-    // if (IS_ERR(merge_thread))
-    // {
-    //     printk(KERN_ERR "ksm: creating kthread failed\n");
-    //     err = PTR_ERR(merge_thread);
-    //     goto out_free;
-    // }
+    merge_thread = kthread_run(merge_scan_thread, NULL, "my_merge");
+    if (IS_ERR(merge_thread))
+    {
+        printk(KERN_ERR "ksm: creating kthread failed\n");
+        err = PTR_ERR(merge_thread);
+        goto out_free;
+    }
+
 #ifdef CONFIG_SYSFS
 	err = sysfs_create_group(mm_kobj, &ksm_attr_group);
 	if (err) {
 		pr_err("ksm: register sysfs failed\n");
 		kthread_stop(ksm_thread);
-		// kthread_stop(merge_thread);
+        kthread_stop(merge_thread);
 		goto out_free;
 	}
 #else
